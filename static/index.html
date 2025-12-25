@@ -2,10 +2,20 @@
 <html>
 <head>
   <meta charset="utf-8"/>
-  <title>WPB Roof Leads (Private)</title>
+  <title>RoofSpy</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover"/>
+
+  <!-- PWA -->
   <link rel="manifest" href="/static/manifest.webmanifest">
   <meta name="theme-color" content="#111111">
+
+  <!-- iOS Home Screen icon support (this is what makes the icon populate) -->
+  <link rel="apple-touch-icon" href="/static/icon-512.png">
+  <link rel="icon" type="image/png" sizes="192x192" href="/static/icon-192.png">
+  <link rel="icon" type="image/png" sizes="512x512" href="/static/icon-512.png">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+
   <style>
     body { margin:0; font-family: -apple-system, BlinkMacSystemFont, Arial, sans-serif; background:#fff; }
     #top { padding: 10px 12px; display:flex; gap:10px; align-items:center; border-bottom:1px solid #e5e5e5; flex-wrap:wrap; }
@@ -22,6 +32,7 @@
 
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
 </head>
+
 <body>
   <div id="top">
     <div class="box">
@@ -43,7 +54,7 @@
       <b>Scan</b><br/>
       <label><input id="fastmode" type="checkbox" /> Fast</label>
       <label style="margin-left:10px;">Delay:</label>
-      <input id="delay" type="number" value="1.0" min="0" step="0.1"/>
+      <input id="delay" type="number" value="1.2" min="0" step="0.1"/>
       <button id="btnStart">Start</button>
       <button id="btnStop">Stop</button>
       <div class="small">If errors spike: Delay 1.3–1.8</div>
@@ -62,7 +73,7 @@
 
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script>
-    // Register service worker for PWA feel (optional)
+    // Register service worker (optional)
     if ('serviceWorker' in navigator) {
       navigator.serviceWorker.register('/static/sw.js').catch(()=>{});
     }
@@ -77,7 +88,10 @@
     }
 
     const map = L.map('map').setView([26.7153, -80.0534], 12);
-    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '&copy; OpenStreetMap' }).addTo(map);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 19,
+      attribution: '&copy; OpenStreetMap'
+    }).addTo(map);
 
     let drawing=false, points=[], tempLine=null, finalPoly=null;
     let lastPolygonLatLngs=null, addresses=[];
@@ -137,7 +151,7 @@
 
     async function startScan(){
       if(!addresses.length){ alert("Fetch parcels first."); return; }
-      const delay = parseFloat(document.getElementById('delay').value || "1.0");
+      const delay = parseFloat(document.getElementById('delay').value || "1.2");
       const fast_mode = document.getElementById('fastmode').checked;
       setStatus("Starting scan…", 3000);
 
@@ -159,7 +173,7 @@
       if(Date.now() < holdUntil) return;
       const r = await fetch(apiUrl("/api/status"));
       if (r.status === 401) {
-        setStatus("Unauthorized. Make sure your link includes ?k=YOUR_SECRET_KEY");
+        setStatus("Unauthorized. Open the app using the link with ?k=YOUR_SECRET_KEY");
         return;
       }
       const s = await r.json();
