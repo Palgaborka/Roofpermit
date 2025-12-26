@@ -16,6 +16,7 @@
 
   <style>
     :root{
+      /* Desktop default: bigger map */
       --mapH: 58vh;
       --topPad: 10px;
       --panelPad: 10px;
@@ -25,7 +26,7 @@
       margin:0;
       font-family: -apple-system, BlinkMacSystemFont, Arial, sans-serif;
       background:#fff;
-      overflow:hidden;
+      overflow:hidden; /* keep everything on one screen */
     }
 
     #top {
@@ -46,13 +47,18 @@
       display:flex;
       align-items:center;
       gap:8px;
-      font-weight:700;
+      font-weight:800;
       color:#111;
+      letter-spacing:0.2px;
+      user-select:none;
+      pointer-events:none;
     }
     #logo img {
-      width:36px;
-      height:36px;
+      width:34px;
+      height:34px;
       border-radius:8px;
+      border:1px solid #e6e6e6;
+      background:#fff;
     }
 
     #map {
@@ -104,14 +110,63 @@
     .small { font-size:12px; color:#444; margin-top:6px; }
     .btnrow button { margin-right:8px; margin-top:6px; }
 
+    /* PHONE: make map smaller so downloads are visible */
     @media (max-width: 600px) {
       :root{
-        --mapH: 36vh;
+        --mapH: 34vh;
         --topPad: 8px;
         --panelPad: 8px;
       }
-      #map { min-height: 220px; }
+      #map { min-height: 210px; }
+      button { padding:9px 10px; }
+      .box { padding:9px; }
       #logo { top:6px; right:8px; }
+    }
+
+    /* PDF Overlay */
+    #pdfOverlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.60);
+      display: none;
+      z-index: 9999;
+    }
+
+    #pdfCard {
+      position: absolute;
+      inset: 10px;
+      background: #fff;
+      border-radius: 14px;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      box-shadow: 0 10px 40px rgba(0,0,0,0.35);
+    }
+
+    #pdfTopbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 10px 12px;
+      border-bottom: 1px solid #e5e5e5;
+      background: #fafafa;
+    }
+
+    #pdfTitle {
+      font-weight: 800;
+      font-size: 14px;
+      color: #111;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    #pdfFrame {
+      flex: 1;
+      width: 100%;
+      border: 0;
+      background: #fff;
     }
   </style>
 
@@ -158,18 +213,20 @@
       <b>Status</b>
       <pre id="status">Ready.</pre>
       <div id="downloads" style="margin-top:8px;"></div>
-      <div class="small">PDF opens inside the app.</div>
+      <div class="small">PDF opens inside the app. Tap Close to return.</div>
     </div>
   </div>
 
-  <!-- PDF overlay (unchanged) -->
-  <div id="pdfOverlay" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,.6); z-index:9999;">
-    <div style="position:absolute; inset:10px; background:#fff; border-radius:14px; overflow:hidden; display:flex; flex-direction:column;">
-      <div style="padding:10px 12px; border-bottom:1px solid #e5e5e5; display:flex; justify-content:space-between; align-items:center;">
-        <div id="pdfTitle" style="font-weight:700;">PDF</div>
-        <button onclick="closePdf()">Close</button>
+  <!-- PDF Viewer Overlay -->
+  <div id="pdfOverlay" role="dialog" aria-modal="true">
+    <div id="pdfCard">
+      <div id="pdfTopbar">
+        <div id="pdfTitle">PDF</div>
+        <div>
+          <button id="btnPdfClose">Close</button>
+        </div>
       </div>
-      <iframe id="pdfFrame" style="flex:1; border:0;"></iframe>
+      <iframe id="pdfFrame" title="RoofSpy PDF Viewer"></iframe>
     </div>
   </div>
 
@@ -179,111 +236,190 @@
       navigator.serviceWorker.register('/static/sw.js').catch(()=>{});
     }
 
-    const KEY = new URLSearchParams(location.search).get("k") || "";
-    const statusEl = document.getElementById("status");
-    const downloadsEl = document.getElementById("downloads");
-    let holdUntil = 0;
+    const params = new URLSearchParams(location.search);
+    const KEY = params.get("k") || "";
 
-    function apiUrl(path){
+    function apiUrl(path) {
       const u = new URL(path, location.origin);
-      if(KEY) u.searchParams.set("k", KEY);
+      if (KEY) u.searchParams.set("k", KEY);
       return u.toString();
     }
 
+    const statusEl = document.getElementById('status');
+    const downloadsEl = document.getElementById('downloads');
+
+    let holdUntil=0;
     function setStatus(msg, holdMs=0){
-      if(holdMs) holdUntil = Date.now()+holdMs;
+      if (holdMs>0) holdUntil=Date.now()+holdMs;
       statusEl.textContent = msg;
     }
 
-    const map = L.map("map").setView([26.7153,-80.0534],12);
-    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",{maxZoom:19}).addTo(map);
-    setTimeout(()=>map.invalidateSize(),400);
+    // Map
+    const map = L.map('map').setView([26.7153, -80.0534], 12);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 19,
+      attribution: '&copy; OpenStreetMap'
+    }).addTo(map);
+    setTimeout(() => { try { map.invalidateSize(); } catch(e){} }, 450);
 
-    let drawing=false, points=[], poly=null, temp=null, addresses=[];
+    // Drawing state
+    let drawing=false, points=[], tempLine=null, finalPoly=null;
+    let lastPolygonLatLngs=null;  // <-- IMPORTANT: [[lat,lng],...]
+    let addresses=[];
 
     function clearAll(){
-      drawing=false; points=[]; addresses=[];
-      downloadsEl.innerHTML="";
-      if(poly) map.removeLayer(poly), poly=null;
-      if(temp) map.removeLayer(temp), temp=null;
-      setStatus("Cleared.",1500);
+      drawing=false; points=[]; lastPolygonLatLngs=null; addresses=[];
+      downloadsEl.innerHTML='';
+      if(tempLine){ map.removeLayer(tempLine); tempLine=null; }
+      if(finalPoly){ map.removeLayer(finalPoly); finalPoly=null; }
+      setStatus("Cleared.", 1500);
     }
 
-    function startDrawing(){ clearAll(); drawing=true; setStatus("Drawing…",2000); }
+    function startDrawing(){
+      clearAll();
+      drawing=true;
+      setStatus("Drawing… tap points then Finish.", 2500);
+    }
 
     function finishPolygon(){
-      if(points.length<3) return alert("Need 3+ points");
+      if(!drawing){ alert("Tap Start first."); return; }
+      if(points.length < 3){ alert("Need 3+ points."); return; }
+
       drawing=false;
-      if(temp) map.removeLayer(temp);
-      poly=L.polygon(points).addTo(map);
-      setStatus("Polygon saved. Fetch parcels.",3000);
+      if(tempLine){ map.removeLayer(tempLine); tempLine=null; }
+
+      finalPoly = L.polygon(points, {weight:2}).addTo(map);
+
+      // ✅ Convert Leaflet LatLng objects into [[lat,lng], ...] for backend
+      lastPolygonLatLngs = points.map(p => [p.lat, p.lng]);
+
+      setStatus("Polygon saved. Tap Fetch.", 2500);
     }
 
-    map.on("click",e=>{
+    map.on('click', (e)=>{
       if(!drawing) return;
       points.push(e.latlng);
-      if(temp) map.removeLayer(temp);
-      temp=L.polyline(points,{dashArray:"6 6"}).addTo(map);
+      if(tempLine) map.removeLayer(tempLine);
+      tempLine = L.polyline(points, {weight:2, dashArray:"6 6"}).addTo(map);
+      setStatus(`Drawing… points: ${points.length}`, 1200);
     });
 
     async function fetchParcels(){
-      setStatus("Fetching parcels…",3000);
-      const r=await fetch(apiUrl("/api/parcels"),{
+      if(!lastPolygonLatLngs){
+        alert("Draw an area and press Finish first.");
+        return;
+      }
+      const limit = parseInt(document.getElementById('limit').value || "80", 10);
+      setStatus("Fetching parcel addresses…", 3000);
+
+      const r = await fetch(apiUrl("/api/parcels"), {
         method:"POST",
-        headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({latlngs:points,limit:+limit.value})
+        headers: {"Content-Type":"application/json"},
+        body: JSON.stringify({ latlngs: lastPolygonLatLngs, limit })
       });
-      const j=await r.json();
-      addresses=j.addresses||[];
-      setStatus(`Fetched ${addresses.length} addresses.`,3000);
+
+      const data = await r.json();
+      if(!data.ok){
+        setStatus("Error: " + (data.error || "unknown"), 6000);
+        return;
+      }
+
+      addresses = data.addresses || [];
+      setStatus(`Fetched ${addresses.length} addresses. Tap Start.`, 3500);
     }
 
     async function startScan(){
-      setStatus("Starting scan…",3000);
-      await fetch(apiUrl("/api/start"),{
+      if(!addresses.length){
+        alert("Fetch parcels first.");
+        return;
+      }
+      const delay = parseFloat(document.getElementById('delay').value || "1.2");
+      const fast_mode = document.getElementById('fastmode').checked;
+      setStatus("Starting scan…", 2500);
+
+      const r = await fetch(apiUrl("/api/start"), {
         method:"POST",
-        headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({addresses,delay:+delay.value,fast_mode:fastmode.checked})
+        headers: {"Content-Type":"application/json"},
+        body: JSON.stringify({ addresses, delay, fast_mode })
       });
+
+      const data = await r.json();
+      if(!data.ok){
+        setStatus("Error: " + (data.error || "unknown"), 6000);
+      }
+    }
+
+    async function stopScan(){
+      await fetch(apiUrl("/api/stop"), { method:"POST" });
+      setStatus("Stopping…", 1500);
+    }
+
+    // PDF Overlay
+    const pdfOverlay = document.getElementById("pdfOverlay");
+    const pdfFrame = document.getElementById("pdfFrame");
+    const pdfTitle = document.getElementById("pdfTitle");
+    const btnPdfClose = document.getElementById("btnPdfClose");
+    let currentPdfUrl = "";
+
+    function openPdfInOverlay(title, url) {
+      currentPdfUrl = url;
+      pdfTitle.textContent = title;
+      pdfFrame.src = url;
+      pdfOverlay.style.display = "block";
+    }
+
+    function closePdfOverlay() {
+      pdfOverlay.style.display = "none";
+      pdfFrame.src = "about:blank";
+      currentPdfUrl = "";
+    }
+
+    btnPdfClose.addEventListener("click", closePdfOverlay);
+    pdfOverlay.addEventListener("click", (e) => { if (e.target === pdfOverlay) closePdfOverlay(); });
+
+    function renderDownloadButtons() {
+      downloadsEl.innerHTML = `
+        <div class="btnrow">
+          <button id="pdfAll">View ALL (PDF)</button>
+          <button id="pdfGood">View GOOD 20+ (PDF)</button>
+        </div>
+      `;
+      document.getElementById("pdfAll").onclick = () => openPdfInOverlay("RoofSpy Results (ALL)", apiUrl("/download/all.pdf"));
+      document.getElementById("pdfGood").onclick = () => openPdfInOverlay("RoofSpy Results (GOOD 20+)", apiUrl("/download/good.pdf"));
     }
 
     async function poll(){
-      if(Date.now()<holdUntil) return;
-      const r=await fetch(apiUrl("/api/status"));
-      const s=await r.json();
+      if(Date.now() < holdUntil) return;
+
+      const r = await fetch(apiUrl("/api/status"));
+      if (r.status === 401) {
+        setStatus("Unauthorized. Open the app using the link with ?k=YOUR_SECRET_KEY");
+        return;
+      }
+      const s = await r.json();
 
       if(s.running){
-        setStatus(`Running… ${s.done}/${s.total} | Good: ${s.good}`);
-        downloadsEl.innerHTML="";
-      }
-      else if(s.message?.startsWith("Done")){
+        downloadsEl.innerHTML = "";
+        setStatus(`Running… ${s.done}/${s.total} | Good: ${s.good}\nStarted: ${s.started_at}\n${s.message || ""}`);
+      } else if (s.message && s.message.startsWith("Done.")) {
+        // ✅ Your requested status line:
         setStatus(`Done. Number of good leads: ${s.good}`);
-        downloadsEl.innerHTML=`
-          <div class="btnrow">
-            <button onclick="openPdf('ALL','/download/all.pdf')">View ALL (PDF)</button>
-            <button onclick="openPdf('GOOD 20+','/download/good.pdf')">View GOOD 20+ (PDF)</button>
-          </div>`;
+        renderDownloadButtons();
+      } else {
+        if (!downloadsEl.innerHTML) {
+          downloadsEl.innerHTML = `<div class="small">Run a scan to enable downloads.</div>`;
+        }
       }
     }
 
-    setInterval(poll,1500);
+    document.getElementById('btnDraw').addEventListener('click', startDrawing);
+    document.getElementById('btnFinish').addEventListener('click', finishPolygon);
+    document.getElementById('btnClear').addEventListener('click', clearAll);
+    document.getElementById('btnFetch').addEventListener('click', fetchParcels);
+    document.getElementById('btnStart').addEventListener('click', startScan);
+    document.getElementById('btnStop').addEventListener('click', stopScan);
 
-    function openPdf(title,path){
-      pdfTitle.textContent=title;
-      pdfFrame.src=apiUrl(path);
-      pdfOverlay.style.display="block";
-    }
-    function closePdf(){
-      pdfOverlay.style.display="none";
-      pdfFrame.src="";
-    }
-
-    btnDraw.onclick=startDrawing;
-    btnFinish.onclick=finishPolygon;
-    btnClear.onclick=clearAll;
-    btnFetch.onclick=fetchParcels;
-    btnStart.onclick=startScan;
-    btnStop.onclick=()=>fetch(apiUrl("/api/stop"),{method:"POST"});
+    setInterval(poll, 1500);
   </script>
 </body>
 </html>
