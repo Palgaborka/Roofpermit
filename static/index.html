@@ -9,7 +9,7 @@
   <link rel="manifest" href="/static/manifest.webmanifest">
   <meta name="theme-color" content="#111111">
 
-  <!-- iOS Home Screen icon support (this is what makes the icon populate) -->
+  <!-- iOS Home Screen icon support -->
   <link rel="apple-touch-icon" href="/static/icon-512.png">
   <link rel="icon" type="image/png" sizes="192x192" href="/static/icon-192.png">
   <link rel="icon" type="image/png" sizes="512x512" href="/static/icon-512.png">
@@ -28,6 +28,7 @@
     pre { margin:0; white-space:pre-wrap; font-size:13px; line-height:1.35; }
     .small { font-size:12px; color:#444; margin-top:6px; }
     a { color:#0a66c2; text-decoration:none; }
+    .btnrow button { margin-right:8px; }
   </style>
 
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
@@ -169,8 +170,57 @@
       await fetch(apiUrl("/api/stop"), { method:"POST" });
     }
 
+    // iPhone/PWA-safe download: fetch -> blob -> share (iOS) or save (desktop)
+    async function downloadCsv(path, filename) {
+      try {
+        setStatus("Preparing download…", 2000);
+
+        const resp = await fetch(apiUrl(path), { method: "GET" });
+        if (!resp.ok) {
+          const txt = await resp.text();
+          alert("Download error:\n" + txt);
+          return;
+        }
+
+        const blob = await resp.blob();
+
+        // Best UX on iPhone Home Screen apps: Share sheet
+        if (navigator.share && blob.size < 20 * 1024 * 1024) {
+          const file = new File([blob], filename, { type: "text/csv" });
+          await navigator.share({ files: [file], title: "RoofSpy CSV" });
+          return;
+        }
+
+        // Fallback: standard browser download
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(url);
+      } catch (e) {
+        alert("Download failed: " + e);
+      }
+    }
+
+    function renderDownloadButtons() {
+      downloadsEl.innerHTML = `
+        <div class="btnrow">
+          <button id="dlAll">Download ALL CSV</button>
+          <button id="dlGood">Download GOOD (20+)</button>
+        </div>
+        <div class="small">On iPhone: you may get a Share prompt (Files / Save to device).</div>
+      `;
+
+      document.getElementById("dlAll").onclick = () => downloadCsv("/download/all", "leads_all.csv");
+      document.getElementById("dlGood").onclick = () => downloadCsv("/download/good", "leads_good_20plus.csv");
+    }
+
     async function poll(){
       if(Date.now() < holdUntil) return;
+
       const r = await fetch(apiUrl("/api/status"));
       if (r.status === 401) {
         setStatus("Unauthorized. Open the app using the link with ?k=YOUR_SECRET_KEY");
@@ -179,14 +229,16 @@
       const s = await r.json();
 
       if(s.running){
+        downloadsEl.innerHTML = ""; // hide downloads while running
         setStatus(`Running… ${s.done}/${s.total} | Good(20+): ${s.good}\nStarted: ${s.started_at}\n${s.message}`);
       } else if (s.message && s.message.startsWith("Done.")) {
         setStatus(`Not running.\n${s.message}`);
-        downloadsEl.innerHTML = `
-          <a href="${apiUrl('/download/all')}" target="_blank">Download ALL CSV</a>
-          &nbsp;•&nbsp;
-          <a href="${apiUrl('/download/good')}" target="_blank">Download GOOD (20+) CSV</a>
-        `;
+        renderDownloadButtons();
+      } else {
+        // idle
+        if (!downloadsEl.innerHTML) {
+          downloadsEl.innerHTML = `<div class="small">Run a scan to enable downloads.</div>`;
+        }
       }
     }
 
