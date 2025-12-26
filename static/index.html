@@ -5,11 +5,9 @@
   <title>RoofSpy</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover"/>
 
-  <!-- PWA -->
   <link rel="manifest" href="/static/manifest.webmanifest">
   <meta name="theme-color" content="#111111">
 
-  <!-- iOS Home Screen icon support -->
   <link rel="apple-touch-icon" href="/static/icon-512.png">
   <link rel="icon" type="image/png" sizes="192x192" href="/static/icon-192.png">
   <link rel="icon" type="image/png" sizes="512x512" href="/static/icon-512.png">
@@ -17,17 +15,17 @@
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 
   <style>
-    body { margin:0; font-family: -apple-system, BlinkMacSystemFont, Arial, sans-serif; background:#fff; }
-    #top { padding: 10px 12px; display:flex; gap:10px; align-items:center; border-bottom:1px solid #e5e5e5; flex-wrap:wrap; }
-    #map { height: calc(100vh - 170px); }
-    #panel { padding:10px 12px; border-top:1px solid #e5e5e5; display:flex; gap:12px; flex-wrap:wrap; align-items:center; }
-    .box { border:1px solid #e5e5e5; padding:10px; border-radius:10px; background:#fafafa; }
-    button { padding:10px 12px; border-radius:10px; border:1px solid #ccc; background:#fff; cursor:pointer; }
-    input[type="number"] { padding:10px; width:90px; border-radius:10px; border:1px solid #ccc; }
+    body { margin:0; font-family: -apple-system, BlinkMacSystemFont, Arial, sans-serif; background:#fff; overflow:hidden; }
+    #top { padding: 8px 10px; display:flex; gap:10px; align-items:flex-start; border-bottom:1px solid #e5e5e5; flex-wrap:wrap; }
+    /* Smaller map so the status + buttons fit without scrolling */
+    #map { height: 45vh; min-height: 260px; }
+    #panel { padding:8px 10px; border-top:1px solid #e5e5e5; display:flex; gap:10px; flex-wrap:wrap; align-items:flex-start; }
+    .box { border:1px solid #e5e5e5; padding:10px; border-radius:12px; background:#fafafa; }
+    button { padding:10px 12px; border-radius:12px; border:1px solid #ccc; background:#fff; cursor:pointer; }
+    input[type="number"] { padding:10px; width:86px; border-radius:12px; border:1px solid #ccc; }
     label { user-select:none; }
     pre { margin:0; white-space:pre-wrap; font-size:13px; line-height:1.35; }
     .small { font-size:12px; color:#444; margin-top:6px; }
-    a { color:#0a66c2; text-decoration:none; }
     .btnrow button { margin-right:8px; }
   </style>
 
@@ -69,12 +67,12 @@
       <b>Status</b>
       <pre id="status">Ready.</pre>
       <div id="downloads" style="margin-top:8px;"></div>
+      <div class="small">Downloads open as PDF in Safari.</div>
     </div>
   </div>
 
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script>
-    // Register service worker (optional)
     if ('serviceWorker' in navigator) {
       navigator.serviceWorker.register('/static/sw.js').catch(()=>{});
     }
@@ -170,52 +168,17 @@
       await fetch(apiUrl("/api/stop"), { method:"POST" });
     }
 
-    // iPhone/PWA-safe download: fetch -> blob -> share (iOS) or save (desktop)
-    async function downloadCsv(path, filename) {
-      try {
-        setStatus("Preparing download…", 2000);
-
-        const resp = await fetch(apiUrl(path), { method: "GET" });
-        if (!resp.ok) {
-          const txt = await resp.text();
-          alert("Download error:\n" + txt);
-          return;
-        }
-
-        const blob = await resp.blob();
-
-        // Best UX on iPhone Home Screen apps: Share sheet
-        if (navigator.share && blob.size < 20 * 1024 * 1024) {
-          const file = new File([blob], filename, { type: "text/csv" });
-          await navigator.share({ files: [file], title: "RoofSpy CSV" });
-          return;
-        }
-
-        // Fallback: standard browser download
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement("a");
-        a.href = url;
-        a.download = filename;
-        document.body.appendChild(a);
-        a.click();
-        a.remove();
-        URL.revokeObjectURL(url);
-      } catch (e) {
-        alert("Download failed: " + e);
-      }
-    }
-
     function renderDownloadButtons() {
       downloadsEl.innerHTML = `
         <div class="btnrow">
-          <button id="dlAll">Download ALL CSV</button>
-          <button id="dlGood">Download GOOD (20+)</button>
+          <button id="pdfAll">Open ALL as PDF</button>
+          <button id="pdfGood">Open GOOD (20+) as PDF</button>
         </div>
-        <div class="small">On iPhone: you may get a Share prompt (Files / Save to device).</div>
       `;
 
-      document.getElementById("dlAll").onclick = () => downloadCsv("/download/all", "leads_all.csv");
-      document.getElementById("dlGood").onclick = () => downloadCsv("/download/good", "leads_good_20plus.csv");
+      // Open inline PDF directly (Safari shows it as a document)
+      document.getElementById("pdfAll").onclick = () => { window.location.href = apiUrl("/download/all.pdf"); };
+      document.getElementById("pdfGood").onclick = () => { window.location.href = apiUrl("/download/good.pdf"); };
     }
 
     async function poll(){
@@ -229,13 +192,12 @@
       const s = await r.json();
 
       if(s.running){
-        downloadsEl.innerHTML = ""; // hide downloads while running
+        downloadsEl.innerHTML = "";
         setStatus(`Running… ${s.done}/${s.total} | Good(20+): ${s.good}\nStarted: ${s.started_at}\n${s.message}`);
       } else if (s.message && s.message.startsWith("Done.")) {
         setStatus(`Not running.\n${s.message}`);
         renderDownloadButtons();
       } else {
-        // idle
         if (!downloadsEl.innerHTML) {
           downloadsEl.innerHTML = `<div class="small">Run a scan to enable downloads.</div>`;
         }
