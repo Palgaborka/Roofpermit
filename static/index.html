@@ -15,18 +15,96 @@
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 
   <style>
-    body { margin:0; font-family: -apple-system, BlinkMacSystemFont, Arial, sans-serif; background:#fff; overflow:hidden; }
-    #top { padding: 8px 10px; display:flex; gap:10px; align-items:flex-start; border-bottom:1px solid #e5e5e5; flex-wrap:wrap; }
-    /* Smaller map so the status + buttons fit without scrolling */
-    #map { height: 45vh; min-height: 260px; }
-    #panel { padding:8px 10px; border-top:1px solid #e5e5e5; display:flex; gap:10px; flex-wrap:wrap; align-items:flex-start; }
-    .box { border:1px solid #e5e5e5; padding:10px; border-radius:12px; background:#fafafa; }
-    button { padding:10px 12px; border-radius:12px; border:1px solid #ccc; background:#fff; cursor:pointer; }
-    input[type="number"] { padding:10px; width:86px; border-radius:12px; border:1px solid #ccc; }
+    :root{
+      /* Desktop default: bigger map */
+      --mapH: 58vh;
+      --topPad: 10px;
+      --panelPad: 10px;
+    }
+
+    body {
+      margin:0;
+      font-family: -apple-system, BlinkMacSystemFont, Arial, sans-serif;
+      background:#fff;
+      overflow:hidden; /* keep everything on one screen */
+    }
+
+    #top {
+      padding: var(--topPad) 12px;
+      display:flex;
+      gap:10px;
+      align-items:flex-start;
+      border-bottom:1px solid #e5e5e5;
+      flex-wrap:wrap;
+    }
+
+    /* Desktop: slightly bigger map */
+    #map {
+      height: var(--mapH);
+      min-height: 340px;
+    }
+
+    #panel {
+      padding: var(--panelPad) 12px;
+      border-top:1px solid #e5e5e5;
+      display:flex;
+      gap:10px;
+      flex-wrap:wrap;
+      align-items:flex-start;
+    }
+
+    .box {
+      border:1px solid #e5e5e5;
+      padding:10px;
+      border-radius:12px;
+      background:#fafafa;
+    }
+
+    button {
+      padding:10px 12px;
+      border-radius:12px;
+      border:1px solid #ccc;
+      background:#fff;
+      cursor:pointer;
+      white-space:nowrap;
+    }
+
+    input[type="number"] {
+      padding:10px;
+      width:86px;
+      border-radius:12px;
+      border:1px solid #ccc;
+    }
+
     label { user-select:none; }
-    pre { margin:0; white-space:pre-wrap; font-size:13px; line-height:1.35; }
+
+    pre {
+      margin:0;
+      white-space:pre-wrap;
+      font-size:13px;
+      line-height:1.35;
+    }
+
     .small { font-size:12px; color:#444; margin-top:6px; }
-    .btnrow button { margin-right:8px; }
+    .btnrow button { margin-right:8px; margin-top:6px; }
+
+    /* PHONE: make map a bit smaller so downloads/status fit without scrolling */
+    @media (max-width: 600px) {
+      :root{
+        --mapH: 36vh;  /* smaller than before so the downloads are visible */
+        --topPad: 8px;
+        --panelPad: 8px;
+      }
+      #map { min-height: 220px; }
+      button { padding:9px 10px; }
+      .box { padding:9px; }
+    }
+
+    /* Short-height devices (landscape phones) */
+    @media (max-height: 700px) {
+      :root{ --mapH: 34vh; }
+      #map { min-height: 200px; }
+    }
   </style>
 
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
@@ -92,6 +170,9 @@
       attribution: '&copy; OpenStreetMap'
     }).addTo(map);
 
+    // Leaflet sometimes needs a size refresh after CSS changes
+    setTimeout(() => { try { map.invalidateSize(); } catch(e){} }, 450);
+
     let drawing=false, points=[], tempLine=null, finalPoly=null;
     let lastPolygonLatLngs=null, addresses=[];
     let holdUntil=0;
@@ -113,6 +194,7 @@
     }
 
     function startDrawing(){ clearAll(); drawing=true; setStatus("Drawing… tap points then Finish.", 3000); }
+
     function finishPolygon(){
       if(!drawing){ alert("Tap Start first."); return; }
       if(points.length < 3){ alert("Need 3+ points."); return; }
@@ -175,8 +257,6 @@
           <button id="pdfGood">Open GOOD (20+) as PDF</button>
         </div>
       `;
-
-      // Open inline PDF directly (Safari shows it as a document)
       document.getElementById("pdfAll").onclick = () => { window.location.href = apiUrl("/download/all.pdf"); };
       document.getElementById("pdfGood").onclick = () => { window.location.href = apiUrl("/download/good.pdf"); };
     }
