@@ -8,12 +8,17 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from parcels import fetch_parcel_addresses_in_polygon
 from scanner import EnerGovScanner
 from utils import LeadRow, clean_street_address
+
+# PDF
+from reportlab.lib.pagesizes import letter, landscape
+from reportlab.pdfgen import canvas
+from reportlab.lib.units import inch
 
 # -----------------------------
 # CONFIG / PRIVATE ACCESS
@@ -21,7 +26,6 @@ from utils import LeadRow, clean_street_address
 
 SECRET_KEY = os.environ.get("SECRET_KEY", "").strip()
 if not SECRET_KEY:
-    # For safety: refuse to run without secret key in cloud
     SECRET_KEY = "CHANGE_ME"
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
@@ -33,13 +37,8 @@ STATIC_DIR = Path(__file__).parent / "static"
 # APP
 # -----------------------------
 
-app = FastAPI(title="WPB Roof Leads (Private)")
-
+app = FastAPI(title="RoofSpy (Private)")
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
-
-# -----------------------------
-# Simple access gate
-# -----------------------------
 
 def require_key(request: Request):
     k = request.query_params.get("k") or request.headers.get("x-app-key") or ""
@@ -68,7 +67,6 @@ scan_rows: List[LeadRow] = []
 _last_all_csv: Optional[Path] = None
 _last_good_csv: Optional[Path] = None
 
-
 def write_csv(path: Path, rows: List[LeadRow]):
     with path.open("w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
@@ -84,6 +82,66 @@ def write_csv(path: Path, rows: List[LeadRow]):
                 r.roof_years, r.is_20plus, r.status, r.seconds
             ])
 
+def rows_to_pdf_bytes(rows: List[LeadRow], title: str) -> bytes:
+    """
+    Simple PDF report that opens directly in Safari.
+    """
+    from io import BytesIO
+    buf = BytesIO()
+
+    # Landscape letter for more columns
+    page_size = landscape(letter)
+    c = canvas.Canvas(buf, pagesize=page_size)
+
+    width, height = page_size
+    left = 0.5 * inch
+    top = height - 0.5 * inch
+    line_h = 12
+
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(left, top, title)
+    c.setFont("Helvetica", 10)
+    c.drawString(left, top - 18, time.strftime("%Y-%m-%d %H:%M:%S"))
+
+    y = top - 40
+
+    # Columns (keep it readable on phone)
+    headers = ["Address", "Roof Date", "Years", "20+?", "Permit #", "Type", "Status"]
+    col_x = [left, left + 230, left + 310, left + 360, left + 420, left + 520, left + 720]
+
+    def draw_row(vals, bold=False):
+        nonlocal y
+        if y < 0.6 * inch:
+            c.showPage()
+            y = top
+        c.setFont("Helvetica-Bold" if bold else "Helvetica", 9)
+        for i, v in enumerate(vals):
+            txt = (v or "")
+            # hard truncate to keep layout
+            if len(txt) > 42 and i in (0, 5, 6):
+                txt = txt[:39] + "…"
+            if len(txt) > 26 and i in (4,):
+                txt = txt[:23] + "…"
+            c.drawString(col_x[i], y, txt)
+        y -= line_h
+
+    draw_row(headers, bold=True)
+    c.line(left, y + 3, width - left, y + 3)
+    y -= 6
+
+    for r in rows:
+        draw_row([
+            r.address,
+            r.roof_date_used,
+            r.roof_years,
+            "YES" if r.is_20plus == "True" else ("NO" if r.is_20plus else ""),
+            r.permit_no,
+            r.type_line,
+            r.status
+        ], bold=False)
+
+    c.save()
+    return buf.getvalue()
 
 def run_scan(addresses: List[str], delay_seconds: float, fast_mode: bool):
     global scan_stop_flag, _last_all_csv, _last_good_csv
@@ -102,7 +160,6 @@ def run_scan(addresses: List[str], delay_seconds: float, fast_mode: bool):
         scan_stop_flag = False
 
     consecutive_errors = 0
-
     base_delay = max(0.8, float(delay_seconds))
     if fast_mode:
         base_delay = max(0.5, float(delay_seconds))
@@ -179,7 +236,6 @@ def run_scan(addresses: List[str], delay_seconds: float, fast_mode: bool):
                         scan_status["done"] += 1
                         scan_status["message"] = f"Last ERROR: {addr_clean} ({row.seconds}s)"
 
-                # Adaptive backoff + jitter (very important for portal stability)
                 extra = 0.0
                 if consecutive_errors >= 4:
                     extra = 1.6
@@ -209,14 +265,12 @@ def run_scan(addresses: List[str], delay_seconds: float, fast_mode: bool):
         _last_all_csv = all_path
         _last_good_csv = good_path
 
-
 # -----------------------------
 # Routes
 # -----------------------------
 
 @app.get("/", response_class=HTMLResponse)
 def root(request: Request):
-    # Gate access on root as well
     require_key(request)
     return HTMLResponse((STATIC_DIR / "index.html").read_text(encoding="utf-8"))
 
@@ -272,6 +326,7 @@ def api_stop(request: Request):
         scan_status["message"] = "Stopping…"
     return JSONResponse({"ok": True})
 
+# CSV downloads (still available)
 @app.get("/download/all")
 def download_all(request: Request):
     require_key(request)
@@ -285,3 +340,32 @@ def download_good(request: Request):
     if not _last_good_csv or not _last_good_csv.exists():
         raise HTTPException(404, "No CSV available yet.")
     return FileResponse(str(_last_good_csv), filename=_last_good_csv.name)
+
+# NEW: PDF opens directly in Safari
+@app.get("/download/all.pdf")
+def download_all_pdf(request: Request):
+    require_key(request)
+    with scan_lock:
+        rows_copy = list(scan_rows)
+    if not rows_copy:
+        raise HTTPException(404, "No results in memory yet. Run a scan first.")
+    pdf = rows_to_pdf_bytes(rows_copy, title="RoofSpy Results (ALL)")
+    return Response(
+        content=pdf,
+        media_type="application/pdf",
+        headers={"Content-Disposition": "inline; filename=roofspy_all.pdf"}
+    )
+
+@app.get("/download/good.pdf")
+def download_good_pdf(request: Request):
+    require_key(request)
+    with scan_lock:
+        rows_copy = [r for r in scan_rows if r.is_20plus == "True"]
+    if not rows_copy:
+        raise HTTPException(404, "No 20+ year leads in memory yet. Run a scan first.")
+    pdf = rows_to_pdf_bytes(rows_copy, title="RoofSpy Results (GOOD 20+)")
+    return Response(
+        content=pdf,
+        media_type="application/pdf",
+        headers={"Content-Disposition": "inline; filename=roofspy_good_20plus.pdf"}
+    )
