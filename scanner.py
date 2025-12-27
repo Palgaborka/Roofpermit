@@ -1,8 +1,9 @@
 from __future__ import annotations
+
 import random
 import time
 from datetime import datetime
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
@@ -16,13 +17,18 @@ from utils import (
     roof_age_years,
 )
 
+
 class EnerGovScanner:
     """
     Playwright-based scanner designed for cloud containers.
+
+    Now supports per-jurisdiction EnerGov portal URLs.
     """
 
-    def __init__(self, fast_mode: bool = False):
+    def __init__(self, fast_mode: bool = False, portal_url: Optional[str] = None):
         self.fast_mode = fast_mode
+        self.portal_url = (portal_url or ENERGOV_SEARCH_URL).strip()
+
         self._pw = None
         self._browser = None
         self._context = None
@@ -36,7 +42,7 @@ class EnerGovScanner:
         )
         self._context = self._browser.new_context(viewport={"width": 1400, "height": 900})
         self._page = self._context.new_page()
-        self._page.goto(ENERGOV_SEARCH_URL, wait_until="domcontentloaded", timeout=60000)
+        self._page.goto(self.portal_url, wait_until="domcontentloaded", timeout=60000)
         self._page.wait_for_timeout(600)
         return self
 
@@ -157,6 +163,14 @@ class EnerGovScanner:
             "is_20plus": (yrs >= 20) if yrs is not None else "",
         }
 
+    def _refresh_portal(self):
+        # Refresh SPA / recover from broken state
+        try:
+            self._page.goto(self.portal_url, wait_until="domcontentloaded", timeout=60000)
+            self._page.wait_for_timeout(800)
+        except Exception:
+            pass
+
     def _search_once(self, query: str) -> Dict[str, Any]:
         self._overlay_gone()
 
@@ -189,6 +203,9 @@ class EnerGovScanner:
         return self._parse_best_roof(page_text)
 
     def search_address(self, street_only: str) -> Dict[str, Any]:
+        # Keep existing behavior, just ensure clean address
+        street_only = clean_street_address(street_only)
+
         variants = address_variants(street_only)
         if not variants:
             return {"roof_detected": False, "error": "Empty address"}
@@ -201,23 +218,19 @@ class EnerGovScanner:
                     res["query_used"] = q
                     return res
                 last_err = res.get("error", "")
+
             except PWTimeout as e:
                 last_err = f"Timeout: {e}"
-                # refresh SPA
-                try:
-                    self._page.goto(ENERGOV_SEARCH_URL, wait_until="domcontentloaded", timeout=60000)
-                    self._page.wait_for_timeout(800)
-                except Exception:
-                    pass
+                self._refresh_portal()
+
             except Exception as e:
                 last_err = f"{type(e).__name__}: {e}"
-                try:
-                    self._page.goto(ENERGOV_SEARCH_URL, wait_until="domcontentloaded", timeout=60000)
-                    self._page.wait_for_timeout(800)
-                except Exception:
-                    pass
+                self._refresh_portal()
 
             # small jitter between variant attempts
-            self._page.wait_for_timeout(int(150 + random.uniform(0, 250)))
+            try:
+                self._page.wait_for_timeout(int(150 + random.uniform(0, 250)))
+            except Exception:
+                pass
 
         return {"roof_detected": False, "error": last_err or "Unknown error"}
