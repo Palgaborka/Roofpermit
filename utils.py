@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 
-DISPLAY_CITY_STATE = "WEST PALM BEACH, FL"
 ENERGOV_SEARCH_URL = "https://westpalmbeachfl-energovpub.tylerhost.net/apps/selfservice/WestPalmBeachFLProd#/search?m=2&ps=10&pn=1&em=true"
 
 ROOF_TYPE_KEYWORDS = [
@@ -31,7 +30,8 @@ def address_variants(street_only: str) -> List[str]:
     s = clean_street_address(street_only)
     if not s:
         return []
-    return [s, f"{s}, West Palm Beach", f"{s} West Palm Beach"]
+    # keep variants broad; connector/jurisdiction controls portal
+    return [s, f"{s}, FL", f"{s} Florida"]
 
 def norm(s: str) -> str:
     return (s or "").upper().replace("–", "-").strip()
@@ -114,7 +114,10 @@ def parse_permit_blocks_from_text(page_text: str) -> List[Dict[str, Any]]:
 @dataclass
 class LeadRow:
     address: str
-    location: str = DISPLAY_CITY_STATE
+    jurisdiction: str = ""          # NEW: selected jurisdiction name
+    owner: str = ""                 # NEW
+    mailing_address: str = ""       # NEW
+    phone: str = ""                 # NEW
     query_used: str = ""
     permit_no: str = ""
     type_line: str = ""
