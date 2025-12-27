@@ -41,30 +41,29 @@ def seed_default() -> None:
     Seeds known jurisdictions once.
     """
     db = _load_db()
-    items = db["items"]
+    items = db.get("items", [])
 
+    # ✅ Use FULL WPB URL (with params). This prevents EnerGov UI weirdness.
     defaults = [
         {
             "state": "FL",
             "name": "WEST PALM BEACH",
             "system": "energov",
-            "portal_url": "https://westpalmbeachfl-energovpub.tylerhost.net/apps/selfservice/WestPalmBeachFLProd#/search?m=2&ps=10&pn=1&em=true
-",
+            "portal_url": "https://westpalmbeachfl-energovpub.tylerhost.net/apps/selfservice/WestPalmBeachFLProd#/search?m=2&ps=10&pn=1&em=true",
             "active": 1,
-        },
- 
+        }
     ]
 
     for d in defaults:
         exists = any(
-            it["state"] == d["state"]
-            and it["system"] == d["system"]
-            and it["portal_url"] == d["portal_url"]
+            it.get("state") == d["state"]
+            and it.get("system") == d["system"]
+            and it.get("portal_url") == d["portal_url"]
             for it in items
         )
         if not exists:
-            new_id = db["next_id"]
-            db["next_id"] += 1
+            new_id = int(db.get("next_id", 1))
+            db["next_id"] = new_id + 1
             items.append(
                 {
                     "id": new_id,
@@ -72,20 +71,21 @@ def seed_default() -> None:
                     "name": d["name"],
                     "system": d["system"],
                     "portal_url": d["portal_url"],
-                    "active": d["active"],
+                    "active": int(d.get("active", 1)),
                 }
             )
 
+    db["items"] = items
     _save_db(db)
 
 
 def list_active(state: str) -> List[Jurisdiction]:
     db = _load_db()
-    s = state.strip().upper()
+    s = (state or "").strip().upper()
     out: List[Jurisdiction] = []
 
-    for it in db["items"]:
-        if it["state"] != s:
+    for it in db.get("items", []):
+        if (it.get("state") or "").strip().upper() != s:
             continue
         if int(it.get("active", 0)) != 1:
             continue
@@ -106,8 +106,10 @@ def list_active(state: str) -> List[Jurisdiction]:
 
 def get_by_id(jurisdiction_id: int) -> Optional[Jurisdiction]:
     db = _load_db()
-    for it in db["items"]:
-        if int(it["id"]) == int(jurisdiction_id):
+    jid = int(jurisdiction_id)
+
+    for it in db.get("items", []):
+        if int(it.get("id", 0)) == jid:
             return Jurisdiction(
                 id=int(it["id"]),
                 state=it["state"],
@@ -131,24 +133,26 @@ def add_jurisdiction(
     Dedupes by (state, system, portal_url).
     """
     db = _load_db()
-    s = state.strip().upper()
-    n = name.strip()
-    sys = system.strip().lower()
-    url = portal_url.strip()
+    s = (state or "").strip().upper()
+    n = (name or "").strip()
+    sys = (system or "").strip().lower()
+    url = (portal_url or "").strip()
 
     if not s or not n or not sys or not url:
         raise ValueError("Missing jurisdiction fields")
 
-    for it in db["items"]:
-        if it["state"] == s and it["system"] == sys and it["portal_url"] == url:
+    # If identical entry exists, update name/active and return id
+    for it in db.get("items", []):
+        if it.get("state") == s and it.get("system") == sys and it.get("portal_url") == url:
             it["name"] = n
             it["active"] = int(active)
             _save_db(db)
             return int(it["id"])
 
-    new_id = db["next_id"]
-    db["next_id"] += 1
-    db["items"].append(
+    new_id = int(db.get("next_id", 1))
+    db["next_id"] = new_id + 1
+
+    db.setdefault("items", []).append(
         {
             "id": new_id,
             "state": s,
@@ -160,7 +164,8 @@ def add_jurisdiction(
     )
     _save_db(db)
     return new_id
-    
+
+
 def delete_jurisdiction(jurisdiction_id: int) -> bool:
     """
     Deletes a jurisdiction by numeric id.
@@ -169,9 +174,11 @@ def delete_jurisdiction(jurisdiction_id: int) -> bool:
     db = _load_db()
     jid = int(jurisdiction_id)
     items = db.get("items", [])
+
     new_items = [it for it in items if int(it.get("id", 0)) != jid]
     if len(new_items) == len(items):
         return False
+
     db["items"] = new_items
     _save_db(db)
     return True
