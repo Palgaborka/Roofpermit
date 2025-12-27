@@ -1,3 +1,4 @@
+from .services.ingest_capecoral import ingest_capecoral
 from fastapi import FastAPI, Depends, Query
 from sqlalchemy.orm import Session
 from sqlalchemy import or_
@@ -66,3 +67,6 @@ def get_permit(permit_id: int, db: Session = Depends(get_db)):
         from fastapi import HTTPException
         raise HTTPException(status_code=404, detail="Not found")
     return p
+@app.post("/ingest/capecoral")
+def ingest_capecoral_now(db: Session = Depends(get_db)):
+    return ingest_capecoral(db, days_back=settings.ingest_days_back)
