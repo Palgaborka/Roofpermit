@@ -1,109 +1,157 @@
 from __future__ import annotations
-import sqlite3
+
+import json
+import re
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Any, Dict, Optional
+from urllib.parse import urlparse
 
-from connectors.base import Jurisdiction
+import requests
 
-DB_PATH = Path("roofspy.db")
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS jurisdictions (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  state TEXT NOT NULL,
-  name TEXT NOT NULL,
-  system TEXT NOT NULL,
-  portal_url TEXT NOT NULL,
-  active INTEGER NOT NULL DEFAULT 1,
-  created_at TEXT NOT NULL DEFAULT (datetime('now')),
-  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
+@dataclass
+class DetectedJurisdiction:
+    system: str  # "energov" | "arcgis"
+    base_url: str
+    display_name: str
+    state: str
+    extra: Dict[str, Any]
 
-CREATE INDEX IF NOT EXISTS idx_jurisdictions_state ON jurisdictions(state);
-CREATE INDEX IF NOT EXISTS idx_jurisdictions_active ON jurisdictions(active);
-"""
 
-def db() -> sqlite3.Connection:
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.row_factory = sqlite3.Row
-    return conn
+ENERGOV_HINTS = [
+    "tylerhost.net/apps/selfservice",
+    "/EnerGovProd/selfservice",
+    "/energovprod/selfservice",
+    "selfservice/#/search",
+    "#/search",
+]
 
-def init_db():
-    conn = db()
-    try:
-        conn.executescript(SCHEMA)
-        conn.commit()
-    finally:
-        conn.close()
+ARCGIS_HINTS = [
+    "arcgis/rest/services",
+    "/FeatureServer",
+    "/MapServer",
+]
 
-def seed_default():
+
+def _safe_city_from_host(host: str) -> str:
+    host = (host or "").lower()
+    host = host.replace("www.", "")
+    # e.g. westpalmbeachfl-energovpub.tylerhost.net -> westpalmbeachfl
+    token = re.split(r"[-.]", host)[0] if host else "jurisdiction"
+    token = re.sub(r"[^a-z0-9]+", "", token)
+    return token or "jurisdiction"
+
+
+def detect_system_from_url(raw_url: str) -> DetectedJurisdiction:
+    if not raw_url or not raw_url.strip():
+        raise ValueError("URL is empty")
+
+    url = raw_url.strip()
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise ValueError("URL must start with http:// or https:// and include a hostname")
+
+    low = url.lower()
+
+    # ArcGIS detection
+    if any(h.lower() in low for h in ARCGIS_HINTS):
+        # Normalize to the service endpoint (strip query params)
+        base_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+        city = _safe_city_from_host(parsed.netloc)
+        return DetectedJurisdiction(
+            system="arcgis",
+            base_url=base_url,
+            display_name=city.replace("fl", "").upper(),
+            state="FL",
+            extra={"source_url": url},
+        )
+
+    # EnerGov detection
+    if any(h.lower() in low for h in ENERGOV_HINTS) or "energov" in low:
+        # Normalize EnerGov base (keep scheme+host; keep full path through /apps/selfservice/XYZProd#/search if present)
+        # We want a stable "search URL" users paste, not necessarily the API endpoints.
+        base_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+        # Many EnerGov URLs rely on hash fragments for routing; keep it if present
+        if parsed.fragment:
+            base_url = base_url + "#" + parsed.fragment
+
+        city = _safe_city_from_host(parsed.netloc)
+        return DetectedJurisdiction(
+            system="energov",
+            base_url=base_url,
+            display_name=city.replace("fl", "").upper(),
+            state="FL",
+            extra={"source_url": url},
+        )
+
+    raise ValueError("Could not detect system type from URL (expected EnerGov or ArcGIS REST URL)")
+
+
+def validate_url_reachable(url: str, timeout: int = 12) -> Dict[str, Any]:
     """
-    Seed West Palm Beach as the first verified EnerGov jurisdiction.
+    Lightweight validation: try GET with short timeout.
+    Returns basic info to show in UI/log.
     """
-    init_db()
-    conn = db()
     try:
-        cur = conn.execute("SELECT COUNT(*) AS c FROM jurisdictions")
-        c = cur.fetchone()["c"]
-        if c > 0:
-            return
+        r = requests.get(url, timeout=timeout, headers={"User-Agent": "RoofSpy/1.0"})
+        return {"ok": True, "status_code": r.status_code, "final_url": str(r.url)}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
-        # WPB EnerGov portal you provided earlier
-        wpb_url = "https://westpalmbeachfl-energovpub.tylerhost.net/apps/selfservice/WestPalmBeachFLProd#/search?m=2&ps=10&pn=1&em=true"
 
-        conn.execute(
-            "INSERT INTO jurisdictions(state,name,system,portal_url,active) VALUES (?,?,?,?,1)",
-            ("FL", "City of West Palm Beach", "energov", wpb_url),
-        )
-        conn.commit()
-    finally:
-        conn.close()
+# ---- Simple JSON registry helpers (independent of your existing jurisdictions module) ----
 
-def list_active(state: str = "FL") -> List[Jurisdiction]:
-    init_db()
-    conn = db()
-    try:
-        rows = conn.execute(
-            "SELECT id,state,name,system,portal_url,active FROM jurisdictions WHERE state=? AND active=1 ORDER BY name",
-            (state.upper(),),
-        ).fetchall()
-        return [Jurisdiction(**dict(r)) for r in rows]
-    finally:
-        conn.close()
+REGISTRY_FILENAME = "jurisdictions.custom.json"
 
-def get_by_id(jurisdiction_id: int) -> Optional[Jurisdiction]:
-    init_db()
-    conn = db()
-    try:
-        r = conn.execute(
-            "SELECT id,state,name,system,portal_url,active FROM jurisdictions WHERE id=?",
-            (jurisdiction_id,),
-        ).fetchone()
-        return Jurisdiction(**dict(r)) if r else None
-    finally:
-        conn.close()
 
-def add_jurisdiction(state: str, name: str, system: str, portal_url: str, active: int = 1) -> int:
-    init_db()
-    conn = db()
-    try:
-        cur = conn.execute(
-            "INSERT INTO jurisdictions(state,name,system,portal_url,active) VALUES (?,?,?,?,?)",
-            (state.upper(), name.strip(), system.strip().lower(), portal_url.strip(), int(active)),
-        )
-        conn.commit()
-        return int(cur.lastrowid)
-    finally:
-        conn.close()
+def load_custom_registry(data_dir: Path) -> Dict[str, Any]:
+    p = data_dir / REGISTRY_FILENAME
+    if not p.exists():
+        return {"jurisdictions": []}
+    return json.loads(p.read_text(encoding="utf-8"))
 
-def deactivate(jurisdiction_id: int):
-    init_db()
-    conn = db()
-    try:
-        conn.execute(
-            "UPDATE jurisdictions SET active=0, updated_at=datetime('now') WHERE id=?",
-            (jurisdiction_id,),
-        )
-        conn.commit()
-    finally:
-        conn.close()
+
+def save_custom_registry(data_dir: Path, payload: Dict[str, Any]) -> None:
+    p = data_dir / REGISTRY_FILENAME
+    p.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def upsert_custom_jurisdiction(
+    data_dir: Path,
+    *,
+    jurisdiction_id: str,
+    display_name: str,
+    state: str,
+    system: str,
+    base_url: str,
+    active: bool = True,
+    extra: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    extra = extra or {}
+    reg = load_custom_registry(data_dir)
+    items = reg.get("jurisdictions", [])
+
+    obj = {
+        "id": jurisdiction_id,
+        "display_name": display_name,
+        "state": state,
+        "system": system,
+        "base_url": base_url,
+        "active": bool(active),
+        "extra": extra,
+    }
+
+    replaced = False
+    for i, it in enumerate(items):
+        if it.get("id") == jurisdiction_id:
+            items[i] = obj
+            replaced = True
+            break
+
+    if not replaced:
+        items.append(obj)
+
+    reg["jurisdictions"] = items
+    save_custom_registry(data_dir, reg)
+    return obj
