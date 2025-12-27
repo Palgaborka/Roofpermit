@@ -165,3 +165,17 @@ def add_jurisdiction(
     )
     _save_db(db)
     return new_id
+def delete_jurisdiction(jurisdiction_id: int) -> bool:
+    """
+    Deletes a jurisdiction by numeric id.
+    Returns True if deleted, False if not found.
+    """
+    db = _load_db()
+    jid = int(jurisdiction_id)
+    items = db.get("items", [])
+    new_items = [it for it in items if int(it.get("id", 0)) != jid]
+    if len(new_items) == len(items):
+        return False
+    db["items"] = new_items
+    _save_db(db)
+    return True
