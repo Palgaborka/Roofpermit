@@ -1,5 +1,3 @@
-import os, sys
-sys.path.append(os.path.dirname(__file__))
 import csv
 import os
 import threading
@@ -58,14 +56,14 @@ def write_csv(path: Path, rows: List[LeadRow]):
     with path.open("w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow([
-            "address", "owner",
+            "address", "jurisdiction", "owner", "mailing_address", "phone",
             "query_used", "permit_no", "type_line",
             "roof_date_used", "issued", "finalized", "applied",
             "roof_years", "is_20plus", "status", "seconds"
         ])
         for r in rows:
             w.writerow([
-                r.address, r.owner,
+                r.address, r.jurisdiction, r.owner, r.mailing_address, r.phone,
                 r.query_used, r.permit_no, r.type_line,
                 r.roof_date_used, r.issued, r.finalized, r.applied,
                 r.roof_years, r.is_20plus, r.status, r.seconds
@@ -78,7 +76,7 @@ def rows_to_pdf_bytes(rows: List[LeadRow], title: str) -> bytes:
     c = canvas.Canvas(buf, pagesize=page_size)
 
     width, height = page_size
-    left = 0.5 * inch
+    left = 0.45 * inch
     top = height - 0.5 * inch
     line_h = 12
 
@@ -87,38 +85,53 @@ def rows_to_pdf_bytes(rows: List[LeadRow], title: str) -> bytes:
     c.setFont("Helvetica", 10)
     c.drawString(left, top - 18, time.strftime("%Y-%m-%d %H:%M:%S"))
 
-    y = top - 40
+    y = top - 42
 
-    headers = ["Address", "Owner", "Roof Date", "Years", "20+?", "Permit #", "Type", "Status"]
-    col_x = [left, left + 250, left + 430, left + 510, left + 560, left + 620, left + 740, left + 860]
+    headers = ["Address", "Owner", "Mailing", "Phone", "Roof Date", "Years", "20+?","Permit #", "Type", "Status"]
+    col_x = [
+        left,            # Address
+        left + 230,      # Owner
+        left + 395,      # Mailing
+        left + 595,      # Phone
+        left + 690,      # Roof Date
+        left + 755,      # Years
+        left + 805,      # 20+?
+        left + 850,      # Permit #
+        left + 940,      # Type
+        left + 1085,     # Status
+    ]
+
+    def clip(s: str, maxlen: int) -> str:
+        s = (s or "")
+        return s if len(s) <= maxlen else (s[:maxlen-1] + "…")
 
     def draw_row(vals, bold=False):
         nonlocal y
         if y < 0.6 * inch:
             c.showPage()
             y = top
-        c.setFont("Helvetica-Bold" if bold else "Helvetica", 9)
+        c.setFont("Helvetica-Bold" if bold else "Helvetica", 8.5)
         for i, v in enumerate(vals):
-            txt = (v or "")
-            if len(txt) > 40 and i in (0, 1, 6, 7):
-                txt = txt[:37] + "…"
-            c.drawString(col_x[i], y, txt)
+            c.drawString(col_x[i], y, v or "")
         y -= line_h
 
+    # header
     draw_row(headers, bold=True)
     c.line(left, y + 3, width - left, y + 3)
     y -= 6
 
     for r in rows:
         draw_row([
-            r.address,
-            r.owner,
+            clip(r.address, 34),
+            clip(r.owner, 22),
+            clip(r.mailing_address, 30),
+            clip(r.phone, 14),
             r.roof_date_used,
             r.roof_years,
             "YES" if r.is_20plus == "True" else ("NO" if r.is_20plus else ""),
-            r.permit_no,
-            r.type_line,
-            r.status
+            clip(r.permit_no, 12),
+            clip(r.type_line, 18),
+            clip(r.status, 16),
         ], bold=False)
 
     c.save()
@@ -134,15 +147,22 @@ def run_scan(parcels: List[Dict[str, str]], jurisdiction_id: int, delay_seconds:
         return
 
     connector = get_connector(j)
+    jname = j.name
 
-    owner_by_addr = {}
-    addresses = []
+    # Map address -> contact fields
+    contact_by_addr: Dict[str, Dict[str, str]] = {}
+    addresses: List[str] = []
+
     for p in parcels:
         addr = clean_street_address((p.get("address") or "").strip())
         if not addr:
             continue
         addresses.append(addr)
-        owner_by_addr[addr] = (p.get("owner") or "").strip()
+        contact_by_addr[addr] = {
+            "owner": (p.get("owner") or "").strip(),
+            "mailing_address": (p.get("mailing_address") or "").strip(),
+            "phone": (p.get("phone") or "").strip(),
+        }
 
     with scan_lock:
         scan_status.update({
@@ -152,7 +172,7 @@ def run_scan(parcels: List[Dict[str, str]], jurisdiction_id: int, delay_seconds:
             "good": 0,
             "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "finished_at": "",
-            "message": f"Scanning {j.name}…",
+            "message": f"Scanning {jname}…",
         })
         scan_rows.clear()
         scan_stop_flag = False
@@ -170,7 +190,10 @@ def run_scan(parcels: List[Dict[str, str]], jurisdiction_id: int, delay_seconds:
                     break
 
             t0 = time.time()
-            owner = owner_by_addr.get(addr, "")
+            cinfo = contact_by_addr.get(addr, {})
+            owner = cinfo.get("owner", "")
+            mailing = cinfo.get("mailing_address", "")
+            phone = cinfo.get("phone", "")
 
             try:
                 res = connector.search_roof(addr)
@@ -180,11 +203,17 @@ def run_scan(parcels: List[Dict[str, str]], jurisdiction_id: int, delay_seconds:
                     err = (res.get("error") or "").strip()
                     status = "NO_ROOF_PERMIT_FOUND" if not err else f"ERROR: {err}"
                     row = LeadRow(
-                        address=addr, owner=owner,
+                        address=addr,
+                        jurisdiction=jname,
+                        owner=owner,
+                        mailing_address=mailing,
+                        phone=phone,
                         query_used=str(res.get("query_used", "")),
-                        status=status, seconds=f"{elapsed:.1f}",
+                        status=status,
+                        seconds=f"{elapsed:.1f}",
                     )
                     consecutive_errors = consecutive_errors + 1 if err else 0
+
                 else:
                     yrs_val = res.get("roof_years", "")
                     yrs_str = ""
@@ -195,7 +224,11 @@ def run_scan(parcels: List[Dict[str, str]], jurisdiction_id: int, delay_seconds:
                             yrs_str = str(yrs_val)
 
                     row = LeadRow(
-                        address=addr, owner=owner,
+                        address=addr,
+                        jurisdiction=jname,
+                        owner=owner,
+                        mailing_address=mailing,
+                        phone=phone,
                         query_used=str(res.get("query_used", "")),
                         permit_no=str(res.get("permit_no", "")),
                         type_line=str(res.get("type_line", "")),
@@ -220,7 +253,15 @@ def run_scan(parcels: List[Dict[str, str]], jurisdiction_id: int, delay_seconds:
             except Exception as e:
                 elapsed = time.time() - t0
                 consecutive_errors += 1
-                row = LeadRow(address=addr, owner=owner, status=f"ERROR: {type(e).__name__}: {e}", seconds=f"{elapsed:.1f}")
+                row = LeadRow(
+                    address=addr,
+                    jurisdiction=jname,
+                    owner=owner,
+                    mailing_address=mailing,
+                    phone=phone,
+                    status=f"ERROR: {type(e).__name__}: {e}",
+                    seconds=f"{elapsed:.1f}",
+                )
                 with scan_lock:
                     scan_rows.append(row)
                     scan_status["done"] += 1
