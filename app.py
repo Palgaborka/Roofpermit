@@ -5,7 +5,6 @@ import os
 import random
 import threading
 import time
-from io import StringIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -15,31 +14,41 @@ from fastapi.staticfiles import StaticFiles
 
 from parcels import fetch_parcel_objects_in_polygon
 from utils import LeadRow, clean_street_address
-from jurisdictions import seed_default, list_active, get_by_id, add_jurisdiction, delete_jurisdiction
+from jurisdictions import add_jurisdiction, get_by_id, list_active, seed_default
 from connectors import get_connector
 
+from reportlab.lib.pagesizes import letter, landscape
+from reportlab.lib.units import inch
+from reportlab.pdfgen import canvas
+
+
+# -----------------------------
+# Config / paths
+# -----------------------------
 SECRET_KEY = (os.environ.get("SECRET_KEY", "") or "").strip() or "CHANGE_ME"
+
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+
 STATIC_DIR = Path(__file__).parent / "static"
 
 app = FastAPI(title="RoofSpy (Florida-Ready)")
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-seed_default()
 
-# -----------------------
-# Auth
-# -----------------------
 def require_key(request: Request):
     k = request.query_params.get("k") or request.headers.get("x-app-key") or ""
     if k != SECRET_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
-# -----------------------
-# Scan state
-# -----------------------
+# Seed jurisdictions on startup (safe to call multiple times)
+seed_default()
+
+
+# -----------------------------
+# Scan state (in-memory)
+# -----------------------------
 scan_lock = threading.Lock()
 scan_thread: Optional[threading.Thread] = None
 scan_stop_flag = False
@@ -59,181 +68,141 @@ _last_all_csv: Optional[Path] = None
 _last_good_csv: Optional[Path] = None
 
 
-# -----------------------
-# CSV writer (keep phone in CSV if present; display will hide it)
-# -----------------------
+# -----------------------------
+# Output helpers
+# -----------------------------
 def write_csv(path: Path, rows: List[LeadRow]):
     with path.open("w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow([
-            "address", "jurisdiction", "owner", "mailing_address", "phone",
-            "query_used", "permit_no", "type_line",
-            "roof_date_used", "issued", "finalized", "applied",
-            "roof_years", "is_20plus", "status", "seconds"
-        ])
+        w.writerow(
+            [
+                "address",
+                "jurisdiction",
+                "owner",
+                "mailing_address",
+                "phone",
+                "query_used",
+                "permit_no",
+                "type_line",
+                "roof_date_used",
+                "issued",
+                "finalized",
+                "applied",
+                "roof_years",
+                "is_20plus",
+                "status",
+                "seconds",
+            ]
+        )
         for r in rows:
-            w.writerow([
-                r.address, r.jurisdiction, r.owner, r.mailing_address, r.phone,
-                r.query_used, r.permit_no, r.type_line,
-                r.roof_date_used, r.issued, r.finalized, r.applied,
-                r.roof_years, r.is_20plus, r.status, r.seconds
-            ])
+            w.writerow(
+                [
+                    r.address,
+                    r.jurisdiction,
+                    r.owner,
+                    r.mailing_address,
+                    r.phone,
+                    r.query_used,
+                    r.permit_no,
+                    r.type_line,
+                    r.roof_date_used,
+                    r.issued,
+                    r.finalized,
+                    r.applied,
+                    r.roof_years,
+                    r.is_20plus,
+                    r.status,
+                    r.seconds,
+                ]
+            )
 
 
-# -----------------------
-# HTML results rendering (responsive + not wide + NO phone column)
-# -----------------------
-def _escape(s: Any) -> str:
-    import html
-    return html.escape("" if s is None else str(s))
+def rows_to_pdf_bytes(rows: List[LeadRow], title: str) -> bytes:
+    from io import BytesIO
 
-def rows_to_html_page(rows: List[LeadRow], title: str) -> str:
-    # Responsive table: wraps long text, horizontal scroll if needed.
-    # Hide phone column intentionally.
-    now_str = time.strftime("%Y-%m-%d %H:%M:%S")
+    buf = BytesIO()
+    page_size = landscape(letter)
+    c = canvas.Canvas(buf, pagesize=page_size)
 
-    # Build rows
-    body = []
+    width, height = page_size
+    left = 0.45 * inch
+    top = height - 0.5 * inch
+    line_h = 12
+
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(left, top, title)
+    c.setFont("Helvetica", 10)
+    c.drawString(left, top - 18, time.strftime("%Y-%m-%d %H:%M:%S"))
+    c.drawString(left + 340, top - 18, f"rows: {len(rows)}")
+
+    y = top - 42
+
+    headers = [
+        "Address",
+        "Owner",
+        "Mailing",
+        "Roof Date",
+        "Years",
+        "20+?",
+        "Permit #",
+        "Type",
+        "Status",
+    ]
+
+    # Make it narrower (mobile friendly) and avoid phone column
+    col_x = [
+        left,            # Address
+        left + 240,      # Owner
+        left + 410,      # Mailing
+        left + 640,      # Roof Date
+        left + 720,      # Years
+        left + 770,      # 20+?
+        left + 820,      # Permit #
+        left + 910,      # Type
+        left + 1000,     # Status
+    ]
+
+    def clip(s: str, maxlen: int) -> str:
+        s = (s or "")
+        return s if len(s) <= maxlen else (s[: maxlen - 1] + "…")
+
+    def draw_row(vals, bold=False):
+        nonlocal y
+        if y < 0.6 * inch:
+            c.showPage()
+            y = top
+        c.setFont("Helvetica-Bold" if bold else "Helvetica", 8.7)
+        for i, v in enumerate(vals):
+            c.drawString(col_x[i], y, v or "")
+        y -= line_h
+
+    draw_row(headers, bold=True)
+    c.line(left, y + 3, width - left, y + 3)
+    y -= 6
+
     for r in rows:
-        body.append(f"""
-          <tr>
-            <td class="addr">{_escape(r.address)}</td>
-            <td class="owner">{_escape(r.owner)}</td>
-            <td class="mail">{_escape(r.mailing_address)}</td>
-            <td class="roof">{_escape(r.roof_date_used)}</td>
-            <td class="yrs">{_escape(r.roof_years)}</td>
-            <td class="pno">{_escape(r.permit_no)}</td>
-            <td class="ptype">{_escape(r.type_line)}</td>
-            <td class="st">{_escape(r.status)}</td>
-          </tr>
-        """)
+        draw_row(
+            [
+                clip(r.address, 36),
+                clip(r.owner, 22),
+                clip(r.mailing_address, 30),
+                clip(r.roof_date_used, 12),
+                clip(r.roof_years, 6),
+                "YES" if r.is_20plus == "True" else ("NO" if r.is_20plus == "False" else ""),
+                clip(r.permit_no, 12),
+                clip(r.type_line, 16),
+                clip(r.status, 18),
+            ],
+            bold=False,
+        )
 
-    table_rows = "\n".join(body) if body else "<tr><td colspan='8' class='empty'>No rows yet.</td></tr>"
-
-    return f"""<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>{_escape(title)}</title>
-  <style>
-    body {{
-      margin: 0;
-      font-family: -apple-system, BlinkMacSystemFont, Arial, sans-serif;
-      background: #fff;
-      color: #111;
-    }}
-    header {{
-      padding: 12px 14px;
-           border-bottom: 1px solid #e6e6e6;
-      display: flex;
-      align-items: baseline;
-      justify-content: space-between;
-      gap: 12px;
-      flex-wrap: wrap;
-    }}
-    h2 {{ margin: 0; font-size: 16px; }}
-    .meta {{ color: #555; font-size: 12px; }}
-    .wrap {{
-      padding: 12px 14px 16px;
-    }}
-    .tablewrap {{
-      border: 1px solid #e6e6e6;
-      border-radius: 12px;
-      overflow: auto;
-      -webkit-overflow-scrolling: touch;
-      background: #fff;
-    }}
-    table {{
-      border-collapse: collapse;
-      width: 100%;
-      min-width: 900px; /* allows horizontal scroll on small screens */
-    }}
-    th, td {{
-      border-bottom: 1px solid #f0f0f0;
-      padding: 10px 10px;
-      text-align: left;
-      vertical-align: top;
-      font-size: 13px;
-      line-height: 1.25;
-      white-space: normal;
-      word-break: break-word;
-    }}
-    th {{
-      position: sticky;
-      top: 0;
-      background: #fafafa;
-      z-index: 2;
-      font-size: 12px;
-      color: #333;
-      border-bottom: 1px solid #e6e6e6;
-    }}
-    tr:hover td {{
-      background: #fcfcfc;
-    }}
-    .addr {{ min-width: 220px; }}
-    .owner {{ min-width: 160px; }}
-    .mail {{ min-width: 220px; }}
-    .roof {{ min-width: 110px; }}
-    .yrs {{ min-width: 70px; }}
-    .pno {{ min-width: 120px; }}
-    .ptype {{ min-width: 160px; }}
-    .st {{ min-width: 140px; }}
-    .empty {{
-      padding: 16px;
-      color: #666;
-      text-align: center;
-    }}
-
-    .hint {{
-      margin-top: 10px;
-      color: #555;
-      font-size: 12px;
-    }}
-
-    @media (max-width: 600px) {{
-      header {{ padding: 10px 12px; }}
-      .wrap {{ padding: 10px 12px 14px; }}
-      table {{ min-width: 820px; }}
-    }}
-  </style>
-</head>
-<body>
-  <header>
-    <h2>{_escape(title)}</h2>
-    <div class="meta">{_escape(now_str)} • rows: {len(rows)}</div>
-  </header>
-  <div class="wrap">
-    <div class="tablewrap">
-      <table>
-        <thead>
-          <tr>
-            <th>Address</th>
-            <th>Owner</th>
-            <th>Mailing</th>
-            <th>Roof Date</th>
-            <th>Years</th>
-            <th>Permit #</th>
-            <th>Type</th>
-            <th>Status</th>
-          </tr>
-        </thead>
-        <tbody>
-          {table_rows}
-        </tbody>
-      </table>
-    </div>
-    <div class="hint">
-      Tip: swipe sideways to see all columns on mobile. Phone column is hidden for now.
-    </div>
-  </div>
-</body>
-</html>"""
+    c.save()
+    return buf.getvalue()
 
 
-# -----------------------
-# Core scan logic
-# -----------------------
+# -----------------------------
+# Scan runner
+# -----------------------------
 def run_scan(parcels: List[Dict[str, str]], jurisdiction_id: int, delay_seconds: float, fast_mode: bool):
     global scan_stop_flag, _last_all_csv, _last_good_csv
 
@@ -246,7 +215,7 @@ def run_scan(parcels: List[Dict[str, str]], jurisdiction_id: int, delay_seconds:
     connector = get_connector(j)
     jname = j.name
 
-    # Map address -> contact fields (owner/mailing/phone)
+    # Map address -> contact fields
     contact_by_addr: Dict[str, Dict[str, str]] = {}
     addresses: List[str] = []
 
@@ -262,22 +231,24 @@ def run_scan(parcels: List[Dict[str, str]], jurisdiction_id: int, delay_seconds:
         }
 
     with scan_lock:
-        scan_status.update({
-            "running": True,
-            "total": len(addresses),
-            "done": 0,
-            "good": 0,
-            "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "finished_at": "",
-            "message": f"Scanning {jname}…",
-        })
+        scan_status.update(
+            {
+                "running": True,
+                "total": len(addresses),
+                "done": 0,
+                "good": 0,
+                "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "finished_at": "",
+                "message": f"Scanning {jname}…",
+            }
+        )
         scan_rows.clear()
         scan_stop_flag = False
 
     consecutive_errors = 0
     base_delay = max(0.6, float(delay_seconds))
     if fast_mode:
-        base_delay = max(0.35, float(delay_seconds))
+        base_delay = max(0.4, float(delay_seconds))
 
     try:
         for addr in addresses:
@@ -310,7 +281,6 @@ def run_scan(parcels: List[Dict[str, str]], jurisdiction_id: int, delay_seconds:
                         seconds=f"{elapsed:.1f}",
                     )
                     consecutive_errors = consecutive_errors + 1 if err else 0
-
                 else:
                     yrs_val = res.get("roof_years", "")
                     yrs_str = ""
@@ -372,7 +342,7 @@ def run_scan(parcels: List[Dict[str, str]], jurisdiction_id: int, delay_seconds:
             elif consecutive_errors == 2:
                 extra = 0.6
 
-            jitter = random.uniform(0.10, 0.45)
+            jitter = random.uniform(0.15, 0.55)
             time.sleep(base_delay + extra + jitter)
 
     finally:
@@ -393,9 +363,9 @@ def run_scan(parcels: List[Dict[str, str]], jurisdiction_id: int, delay_seconds:
         _last_good_csv = good_path
 
 
-# -----------------------
+# -----------------------------
 # Routes
-# -----------------------
+# -----------------------------
 @app.get("/", response_class=HTMLResponse)
 def root(request: Request):
     require_key(request)
@@ -426,17 +396,6 @@ async def api_jurisdictions_add(request: Request):
     return JSONResponse({"ok": True, "id": new_id})
 
 
-@app.post("/api/jurisdictions/delete")
-async def api_jurisdictions_delete(request: Request):
-    require_key(request)
-    body = await request.json()
-    jid = int(body.get("id") or 0)
-    if not jid:
-        return JSONResponse({"ok": False, "error": "Missing id"})
-    ok = delete_jurisdiction(jid)
-    return JSONResponse({"ok": True, "deleted": bool(ok)})
-
-
 @app.get("/api/status")
 def api_status(request: Request):
     require_key(request)
@@ -450,6 +409,7 @@ async def api_parcels(request: Request):
     body = await request.json()
     latlngs = body.get("latlngs")
     limit = int(body.get("limit", 80))
+
     if not latlngs or not isinstance(latlngs, list):
         return JSONResponse({"ok": False, "error": "Missing latlngs (draw an area first)."})
     try:
@@ -497,28 +457,36 @@ def api_stop(request: Request):
     return JSONResponse({"ok": True})
 
 
-# -----------------------
-# NEW: HTML results pages (responsive + not wide)
-# -----------------------
-@app.get("/results/all", response_class=HTMLResponse)
-def results_all(request: Request):
+@app.get("/download/all.pdf")
+def download_all_pdf(request: Request):
     require_key(request)
     with scan_lock:
         rows_copy = list(scan_rows)
-    return HTMLResponse(rows_to_html_page(rows_copy, "RoofSpy Results (ALL)"))
+    if not rows_copy:
+        raise HTTPException(404, "No results in memory yet. Run a scan first.")
+    pdf = rows_to_pdf_bytes(rows_copy, title="RoofSpy Results (ALL)")
+    return Response(
+        content=pdf,
+        media_type="application/pdf",
+        headers={"Content-Disposition": "inline; filename=roofspy_all.pdf"},
+    )
 
 
-@app.get("/results/good", response_class=HTMLResponse)
-def results_good(request: Request):
+@app.get("/download/good.pdf")
+def download_good_pdf(request: Request):
     require_key(request)
     with scan_lock:
         rows_copy = [r for r in scan_rows if r.is_20plus == "True"]
-    return HTMLResponse(rows_to_html_page(rows_copy, "RoofSpy Results (GOOD 20+)"))
+    if not rows_copy:
+        raise HTTPException(404, "No 20+ year leads in memory yet. Run a scan first.")
+    pdf = rows_to_pdf_bytes(rows_copy, title="RoofSpy Results (GOOD 20+)")
+    return Response(
+        content=pdf,
+        media_type="application/pdf",
+        headers={"Content-Disposition": "inline; filename=roofspy_good_20plus.pdf"},
+    )
 
 
-# -----------------------
-# CSV downloads (unchanged)
-# -----------------------
 @app.get("/download/all")
 def download_all(request: Request):
     require_key(request)
@@ -533,3 +501,24 @@ def download_good(request: Request):
     if not _last_good_csv or not _last_good_csv.exists():
         raise HTTPException(404, "No CSV available yet.")
     return FileResponse(str(_last_good_csv), filename=_last_good_csv.name)
+
+
+# ============================================================
+# DEBUG ROUTES (EnerGov DOM debugging)
+# ============================================================
+@app.get("/debug/energov.png")
+def debug_energov_png(request: Request):
+    require_key(request)
+    p = DATA_DIR / "energov_debug.png"
+    if not p.exists():
+        raise HTTPException(404, "No debug screenshot yet. Run a scan that triggers debug output first.")
+    return FileResponse(str(p), filename="energov_debug.png")
+
+
+@app.get("/debug/energov.html")
+def debug_energov_html(request: Request):
+    require_key(request)
+    p = DATA_DIR / "energov_debug.html"
+    if not p.exists():
+        raise HTTPException(404, "No debug html yet. Run a scan that triggers debug output first.")
+    return FileResponse(str(p), filename="energov_debug.html")
