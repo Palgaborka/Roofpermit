@@ -2,16 +2,15 @@ from __future__ import annotations
 
 import csv
 import os
-import re
+import random
 import threading
 import time
-import random
+from io import StringIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from urllib.parse import urlparse
 
-from fastapi import FastAPI, Request, HTTPException, Form
-from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, Response
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from parcels import fetch_parcel_objects_in_polygon
@@ -19,16 +18,7 @@ from utils import LeadRow, clean_street_address
 from jurisdictions import seed_default, list_active, get_by_id, add_jurisdiction, delete_jurisdiction
 from connectors import get_connector
 
-from reportlab.lib.pagesizes import letter, landscape
-from reportlab.pdfgen import canvas
-from reportlab.lib.units import inch
-
-
-# ---------------------------
-# Config
-# ---------------------------
-
-SECRET_KEY = os.environ.get("SECRET_KEY", "").strip() or "CHANGE_ME"
+SECRET_KEY = (os.environ.get("SECRET_KEY", "") or "").strip() or "CHANGE_ME"
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 STATIC_DIR = Path(__file__).parent / "static"
@@ -36,100 +26,20 @@ STATIC_DIR = Path(__file__).parent / "static"
 app = FastAPI(title="RoofSpy (Florida-Ready)")
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
+seed_default()
 
-# ---------------------------
+# -----------------------
 # Auth
-# ---------------------------
-
+# -----------------------
 def require_key(request: Request):
     k = request.query_params.get("k") or request.headers.get("x-app-key") or ""
     if k != SECRET_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
-# ---------------------------
-# Jurisdiction URL detection (inline helper for onboard page)
-# ---------------------------
-
-ENERGOV_HINTS = [
-    "tylerhost.net/apps/selfservice",
-    "/energovprod/selfservice",
-    "selfservice/#/search",
-    "#/search",
-    "energov",
-]
-
-ARCGIS_HINTS = [
-    "arcgis/rest/services",
-    "/featureserver",
-    "/mapserver",
-]
-
-
-def detect_system_from_url(raw_url: str) -> tuple[str, str]:
-    """
-    Returns (system, normalized_base_url)
-      system: "energov" | "arcgis"
-    """
-    if not raw_url or not raw_url.strip():
-        raise ValueError("URL is empty")
-
-    url = raw_url.strip()
-    parsed = urlparse(url)
-    if parsed.scheme not in ("http", "https") or not parsed.netloc:
-        raise ValueError("URL must start with http(s):// and include a hostname")
-
-    low = url.lower()
-
-    # ArcGIS detection
-    if any(h in low for h in ARCGIS_HINTS):
-        base_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
-        return "arcgis", base_url
-
-    # EnerGov detection
-    if any(h in low for h in ENERGOV_HINTS):
-        base_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
-        if parsed.fragment:
-            base_url += "#" + parsed.fragment
-        return "energov", base_url
-
-    raise ValueError("Could not detect permit system type (expected EnerGov or ArcGIS URL)")
-
-
-def validate_url_reachable(url: str, timeout: int = 10) -> Dict[str, Any]:
-    """
-    Lightweight validation: just checks URL responds.
-    """
-    try:
-        import requests
-        r = requests.get(url, timeout=timeout, headers={"User-Agent": "RoofSpy/1.0"})
-        return {"ok": bool(r.ok), "status_code": r.status_code, "final_url": str(r.url)}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
-
-def infer_display_name_from_url(url: str) -> str:
-    host = (urlparse(url).netloc or "").lower().replace("www.", "")
-    token = re.split(r"[-.]", host)[0] if host else "JURISDICTION"
-    token = re.sub(r"[^a-z0-9]+", "", token)
-    if not token:
-        return "JURISDICTION"
-    if token.endswith("fl") and len(token) > 2:
-        token = token[:-2]
-    return token.upper()
-
-
-# ---------------------------
-# Startup seed
-# ---------------------------
-
-seed_default()
-
-
-# ---------------------------
+# -----------------------
 # Scan state
-# ---------------------------
-
+# -----------------------
 scan_lock = threading.Lock()
 scan_thread: Optional[threading.Thread] = None
 scan_stop_flag = False
@@ -149,10 +59,9 @@ _last_all_csv: Optional[Path] = None
 _last_good_csv: Optional[Path] = None
 
 
-# ---------------------------
-# Export helpers
-# ---------------------------
-
+# -----------------------
+# CSV writer (keep phone in CSV if present; display will hide it)
+# -----------------------
 def write_csv(path: Path, rows: List[LeadRow]):
     with path.open("w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
@@ -171,83 +80,165 @@ def write_csv(path: Path, rows: List[LeadRow]):
             ])
 
 
-def rows_to_pdf_bytes(rows: List[LeadRow], title: str) -> bytes:
-    from io import BytesIO
-    buf = BytesIO()
-    page_size = landscape(letter)
-    c = canvas.Canvas(buf, pagesize=page_size)
+# -----------------------
+# HTML results rendering (responsive + not wide + NO phone column)
+# -----------------------
+def _escape(s: Any) -> str:
+    import html
+    return html.escape("" if s is None else str(s))
 
-    width, height = page_size
-    left = 0.45 * inch
-    top = height - 0.5 * inch
-    line_h = 12
+def rows_to_html_page(rows: List[LeadRow], title: str) -> str:
+    # Responsive table: wraps long text, horizontal scroll if needed.
+    # Hide phone column intentionally.
+    now_str = time.strftime("%Y-%m-%d %H:%M:%S")
 
-    c.setFont("Helvetica-Bold", 16)
-    c.drawString(left, top, title)
-    c.setFont("Helvetica", 10)
-    c.drawString(left, top - 18, time.strftime("%Y-%m-%d %H:%M:%S"))
-
-    y = top - 42
-
-    headers = ["Address", "Owner", "Mailing", "Phone", "Roof Date", "Years", "20+?", "Permit #", "Type", "Status"]
-    col_x = [
-        left,            # Address
-        left + 230,      # Owner
-        left + 395,      # Mailing
-        left + 595,      # Phone
-        left + 690,      # Roof Date
-        left + 755,      # Years
-        left + 805,      # 20+?
-        left + 850,      # Permit #
-        left + 940,      # Type
-        left + 1085,     # Status
-    ]
-
-    def clip(s: str, maxlen: int) -> str:
-        s = (s or "")
-        return s if len(s) <= maxlen else (s[:maxlen - 1] + "…")
-
-    def draw_row(vals, bold: bool = False):
-        nonlocal y
-        if y < 0.6 * inch:
-            c.showPage()
-            y = top
-        c.setFont("Helvetica-Bold" if bold else "Helvetica", 8.5)
-        for i, v in enumerate(vals):
-            c.drawString(col_x[i], y, v or "")
-        y -= line_h
-
-    draw_row(headers, bold=True)
-    c.line(left, y + 3, width - left, y + 3)
-    y -= 6
-
+    # Build rows
+    body = []
     for r in rows:
-        draw_row([
-            clip(r.address, 34),
-            clip(r.owner, 22),
-            clip(r.mailing_address, 30),
-            clip(r.phone, 14),
-            r.roof_date_used,
-            r.roof_years,
-            "YES" if r.is_20plus == "True" else ("NO" if r.is_20plus else ""),
-            clip(r.permit_no, 12),
-            clip(r.type_line, 18),
-            clip(r.status, 16),
-        ])
+        body.append(f"""
+          <tr>
+            <td class="addr">{_escape(r.address)}</td>
+            <td class="owner">{_escape(r.owner)}</td>
+            <td class="mail">{_escape(r.mailing_address)}</td>
+            <td class="roof">{_escape(r.roof_date_used)}</td>
+            <td class="yrs">{_escape(r.roof_years)}</td>
+            <td class="pno">{_escape(r.permit_no)}</td>
+            <td class="ptype">{_escape(r.type_line)}</td>
+            <td class="st">{_escape(r.status)}</td>
+          </tr>
+        """)
 
-    c.save()
-    return buf.getvalue()
+    table_rows = "\n".join(body) if body else "<tr><td colspan='8' class='empty'>No rows yet.</td></tr>"
+
+    return f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>{_escape(title)}</title>
+  <style>
+    body {{
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, Arial, sans-serif;
+      background: #fff;
+      color: #111;
+    }}
+    header {{
+      padding: 12px 14px;
+           border-bottom: 1px solid #e6e6e6;
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+    }}
+    h2 {{ margin: 0; font-size: 16px; }}
+    .meta {{ color: #555; font-size: 12px; }}
+    .wrap {{
+      padding: 12px 14px 16px;
+    }}
+    .tablewrap {{
+      border: 1px solid #e6e6e6;
+      border-radius: 12px;
+      overflow: auto;
+      -webkit-overflow-scrolling: touch;
+      background: #fff;
+    }}
+    table {{
+      border-collapse: collapse;
+      width: 100%;
+      min-width: 900px; /* allows horizontal scroll on small screens */
+    }}
+    th, td {{
+      border-bottom: 1px solid #f0f0f0;
+      padding: 10px 10px;
+      text-align: left;
+      vertical-align: top;
+      font-size: 13px;
+      line-height: 1.25;
+      white-space: normal;
+      word-break: break-word;
+    }}
+    th {{
+      position: sticky;
+      top: 0;
+      background: #fafafa;
+      z-index: 2;
+      font-size: 12px;
+      color: #333;
+      border-bottom: 1px solid #e6e6e6;
+    }}
+    tr:hover td {{
+      background: #fcfcfc;
+    }}
+    .addr {{ min-width: 220px; }}
+    .owner {{ min-width: 160px; }}
+    .mail {{ min-width: 220px; }}
+    .roof {{ min-width: 110px; }}
+    .yrs {{ min-width: 70px; }}
+    .pno {{ min-width: 120px; }}
+    .ptype {{ min-width: 160px; }}
+    .st {{ min-width: 140px; }}
+    .empty {{
+      padding: 16px;
+      color: #666;
+      text-align: center;
+    }}
+
+    .hint {{
+      margin-top: 10px;
+      color: #555;
+      font-size: 12px;
+    }}
+
+    @media (max-width: 600px) {{
+      header {{ padding: 10px 12px; }}
+      .wrap {{ padding: 10px 12px 14px; }}
+      table {{ min-width: 820px; }}
+    }}
+  </style>
+</head>
+<body>
+  <header>
+    <h2>{_escape(title)}</h2>
+    <div class="meta">{_escape(now_str)} • rows: {len(rows)}</div>
+  </header>
+  <div class="wrap">
+    <div class="tablewrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Address</th>
+            <th>Owner</th>
+            <th>Mailing</th>
+            <th>Roof Date</th>
+            <th>Years</th>
+            <th>Permit #</th>
+            <th>Type</th>
+            <th>Status</th>
+          </tr>
+        </thead>
+        <tbody>
+          {table_rows}
+        </tbody>
+      </table>
+    </div>
+    <div class="hint">
+      Tip: swipe sideways to see all columns on mobile. Phone column is hidden for now.
+    </div>
+  </div>
+</body>
+</html>"""
 
 
-# ---------------------------
-# Scan logic
-# ---------------------------
-
+# -----------------------
+# Core scan logic
+# -----------------------
 def run_scan(parcels: List[Dict[str, str]], jurisdiction_id: int, delay_seconds: float, fast_mode: bool):
     global scan_stop_flag, _last_all_csv, _last_good_csv
 
     j = get_by_id(jurisdiction_id)
-    if not j or j.active != 1:
+    if not j or int(getattr(j, "active", 0)) != 1:
         with scan_lock:
             scan_status.update({"running": False, "message": "Invalid jurisdiction."})
         return
@@ -255,6 +246,7 @@ def run_scan(parcels: List[Dict[str, str]], jurisdiction_id: int, delay_seconds:
     connector = get_connector(j)
     jname = j.name
 
+    # Map address -> contact fields (owner/mailing/phone)
     contact_by_addr: Dict[str, Dict[str, str]] = {}
     addresses: List[str] = []
 
@@ -285,7 +277,7 @@ def run_scan(parcels: List[Dict[str, str]], jurisdiction_id: int, delay_seconds:
     consecutive_errors = 0
     base_delay = max(0.6, float(delay_seconds))
     if fast_mode:
-        base_delay = max(0.4, float(delay_seconds))
+        base_delay = max(0.35, float(delay_seconds))
 
     try:
         for addr in addresses:
@@ -318,6 +310,7 @@ def run_scan(parcels: List[Dict[str, str]], jurisdiction_id: int, delay_seconds:
                         seconds=f"{elapsed:.1f}",
                     )
                     consecutive_errors = consecutive_errors + 1 if err else 0
+
                 else:
                     yrs_val = res.get("roof_years", "")
                     yrs_str = ""
@@ -379,7 +372,7 @@ def run_scan(parcels: List[Dict[str, str]], jurisdiction_id: int, delay_seconds:
             elif consecutive_errors == 2:
                 extra = 0.6
 
-            jitter = random.uniform(0.15, 0.55)
+            jitter = random.uniform(0.10, 0.45)
             time.sleep(base_delay + extra + jitter)
 
     finally:
@@ -400,104 +393,14 @@ def run_scan(parcels: List[Dict[str, str]], jurisdiction_id: int, delay_seconds:
         _last_good_csv = good_path
 
 
-# ---------------------------
+# -----------------------
 # Routes
-# ---------------------------
-
+# -----------------------
 @app.get("/", response_class=HTMLResponse)
 def root(request: Request):
     require_key(request)
     return HTMLResponse((STATIC_DIR / "index.html").read_text(encoding="utf-8"))
 
-
-# Admin onboard page (optional UI; your main UI uses /api/jurisdictions/add)
-@app.get("/jurisdictions/onboard", response_class=HTMLResponse)
-def onboard_form(request: Request):
-    require_key(request)
-    return """
-    <html>
-      <head>
-        <title>RoofSpy - Add Jurisdiction</title>
-        <style>
-          body{font-family:Arial, sans-serif; max-width:900px; margin:40px auto; padding:0 16px;}
-          input, button{font-size:16px; padding:10px; width:100%;}
-          .row{margin:14px 0;}
-          .small{color:#666; font-size:13px;}
-          code{background:#f2f2f2; padding:2px 6px; border-radius:6px;}
-        </style>
-      </head>
-      <body>
-        <h2>Add a City / Jurisdiction</h2>
-        <p class="small">Paste a permit search URL. We auto-detect <b>EnerGov</b> vs <b>ArcGIS</b> and add it.</p>
-
-        <form method="post" action="/jurisdictions/onboard">
-          <div class="row">
-            <label>Permit search URL</label><br/>
-            <input name="url" placeholder="https://...#/search" required />
-          </div>
-
-          <div class="row">
-            <label>State (default FL)</label><br/>
-            <input name="state" value="FL" />
-          </div>
-
-          <div class="row">
-            <label>Optional City Display Name (leave blank to auto)</label><br/>
-            <input name="display_name" placeholder="CAPE CORAL" />
-          </div>
-
-          <div class="row">
-            <button type="submit">Detect & Save</button>
-          </div>
-        </form>
-
-        <p class="small">Saved to your registry. Refresh main app after saving.</p>
-      </body>
-    </html>
-    """
-
-
-@app.post("/jurisdictions/onboard", response_class=HTMLResponse)
-def onboard_submit(
-    request: Request,
-    url: str = Form(...),
-    state: str = Form("FL"),
-    display_name: str = Form(""),
-):
-    require_key(request)
-    try:
-        system, normalized_url = detect_system_from_url(url)
-        state = (state or "FL").strip().upper()
-        name = display_name.strip() if display_name.strip() else infer_display_name_from_url(url)
-        reach = validate_url_reachable(url)
-        new_id = add_jurisdiction(state, name, system, normalized_url, active=1)
-
-        return f"""
-        <html><body style="font-family:Arial; max-width:900px; margin:40px auto; padding:0 16px;">
-          <h2>Saved ✅</h2>
-          <p><b>ID:</b> {new_id}</p>
-          <p><b>Name:</b> {name}</p>
-          <p><b>State:</b> {state}</p>
-          <p><b>System:</b> {system}</p>
-          <p><b>Base URL:</b> <a href="{normalized_url}">{normalized_url}</a></p>
-          <p><b>Reachable check:</b> {reach}</p>
-          <p><a href="/jurisdictions/onboard?k={SECRET_KEY}">Add another</a></p>
-          <p><a href="/?k={SECRET_KEY}">Go to app home</a></p>
-        </body></html>
-        """
-    except Exception as e:
-        return f"""
-        <html><body style="font-family:Arial; max-width:900px; margin:40px auto; padding:0 16px;">
-          <h2>Error</h2>
-          <p>{str(e)}</p>
-          <p><a href="/jurisdictions/onboard?k={SECRET_KEY}">Go back</a></p>
-        </body></html>
-        """
-
-
-# ---------------------------
-# API
-# ---------------------------
 
 @app.get("/api/jurisdictions")
 def api_jurisdictions(request: Request):
@@ -527,18 +430,11 @@ async def api_jurisdictions_add(request: Request):
 async def api_jurisdictions_delete(request: Request):
     require_key(request)
     body = await request.json()
-
     jid = int(body.get("id") or 0)
     if not jid:
         return JSONResponse({"ok": False, "error": "Missing id"})
-
-    # Safety: no deleting while scan runs
-    with scan_lock:
-        if scan_status.get("running"):
-            return JSONResponse({"ok": False, "error": "Cannot delete while scan is running"})
-
     ok = delete_jurisdiction(jid)
-    return JSONResponse({"ok": bool(ok)})
+    return JSONResponse({"ok": True, "deleted": bool(ok)})
 
 
 @app.get("/api/status")
@@ -601,40 +497,28 @@ def api_stop(request: Request):
     return JSONResponse({"ok": True})
 
 
-# ---------------------------
-# Downloads
-# ---------------------------
-
-@app.get("/download/all.pdf")
-def download_all_pdf(request: Request):
+# -----------------------
+# NEW: HTML results pages (responsive + not wide)
+# -----------------------
+@app.get("/results/all", response_class=HTMLResponse)
+def results_all(request: Request):
     require_key(request)
     with scan_lock:
         rows_copy = list(scan_rows)
-    if not rows_copy:
-        raise HTTPException(404, "No results in memory yet. Run a scan first.")
-    pdf = rows_to_pdf_bytes(rows_copy, title="RoofSpy Results (ALL)")
-    return Response(
-        content=pdf,
-        media_type="application/pdf",
-        headers={"Content-Disposition": "inline; filename=roofspy_all.pdf"},
-    )
+    return HTMLResponse(rows_to_html_page(rows_copy, "RoofSpy Results (ALL)"))
 
 
-@app.get("/download/good.pdf")
-def download_good_pdf(request: Request):
+@app.get("/results/good", response_class=HTMLResponse)
+def results_good(request: Request):
     require_key(request)
     with scan_lock:
         rows_copy = [r for r in scan_rows if r.is_20plus == "True"]
-    if not rows_copy:
-        raise HTTPException(404, "No 20+ year leads in memory yet. Run a scan first.")
-    pdf = rows_to_pdf_bytes(rows_copy, title="RoofSpy Results (GOOD 20+)")
-    return Response(
-        content=pdf,
-        media_type="application/pdf",
-        headers={"Content-Disposition": "inline; filename=roofspy_good_20plus.pdf"},
-    )
+    return HTMLResponse(rows_to_html_page(rows_copy, "RoofSpy Results (GOOD 20+)"))
 
 
+# -----------------------
+# CSV downloads (unchanged)
+# -----------------------
 @app.get("/download/all")
 def download_all(request: Request):
     require_key(request)
