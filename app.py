@@ -649,8 +649,6 @@ def download_good(request: Request):
     return FileResponse(str(_last_good_csv), filename=_last_good_csv.name)
 # app.py
 
-from __future__ import annotations
-
 import csv
 import os
 import re
