@@ -4,7 +4,7 @@ import re
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Tuple
 
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
 
@@ -40,23 +40,16 @@ def parse_address_for_search(raw: str) -> Tuple[str, str]:
     # Common pattern: number + rest
     m = re.match(r"^(\d+)\s+(.*)$", s)
     if not m:
-        # Some datasets can produce things like "LOT 12 ...", ignore those
         raise ValueError(f"No usable search input (missing house number): {raw}")
 
     house = m.group(1)
     rest = m.group(2).strip()
 
-    # If rest is very short (e.g., "DIVISION") still OK
-    # Normalize ordinals: "7TH" stays "7TH"
-    # Normalize multiple spaces
     rest = _clean_spaces(rest)
 
-    # If rest ends with something weird, still keep it
-    # But try to clip after a plausible street suffix to avoid noise
-    # Example: "800 DOUGLAS AVE REAR" -> keep "DOUGLAS AVE"
+    # Clip after suffix token if present
     suf = re.search(rf"\b{_STREET_SUFFIXES}\b", rest)
     if suf:
-        # keep through the suffix token
         tokens = rest.split()
         cut_idx = 0
         for i, t in enumerate(tokens):
@@ -88,13 +81,11 @@ def _get_context():
         _pw = sync_playwright().start()
         _browser = _pw.chromium.launch(headless=True)
 
-        # Faster + less bandwidth
         _context = _browser.new_context(
             viewport={"width": 1280, "height": 800},
             user_agent="RoofSpy/1.0",
         )
 
-        # Block heavy resources (speed)
         def route_handler(route, request):
             rt = request.resource_type
             if rt in ("image", "media", "font"):
@@ -108,9 +99,35 @@ def _get_context():
 # -----------------------------
 # EnerGov connector
 # -----------------------------
+def _extract_portal_url(portal_or_jurisdiction: Any) -> str:
+    """
+    Accepts either:
+      - a portal_url string
+      - a Jurisdiction object with .portal_url
+    Returns a clean string URL.
+    """
+    if isinstance(portal_or_jurisdiction, str):
+        url = portal_or_jurisdiction.strip()
+    else:
+        url = getattr(portal_or_jurisdiction, "portal_url", "") or ""
+        url = str(url).strip()
+
+    if not url.startswith("http"):
+        raise ValueError("EnerGovConnector requires a valid portal URL string (http/https)")
+    return url
+
+
 @dataclass
 class EnerGovConnector:
-    portal_url: str  # the URL you stored in jurisdictions.portal_url
+    """
+    IMPORTANT:
+      Your get_connector() may pass a Jurisdiction object.
+      This class safely converts it to a string portal_url so Playwright page.goto() never crashes.
+    """
+    portal: Any  # string URL OR Jurisdiction object
+
+    def __post_init__(self):
+        self.portal_url: str = _extract_portal_url(self.portal)
 
     def search_roof(self, address: str) -> Dict[str, Any]:
         """
@@ -130,23 +147,12 @@ class EnerGovConnector:
         ctx = _get_context()
         page = ctx.new_page()
 
-        # Hard timeouts (don’t hang forever)
         page.set_default_timeout(25000)
 
         try:
-            # Go to portal search page
+            # ✅ FIX: This is always a STRING now
             page.goto(self.portal_url, wait_until="domcontentloaded")
 
-            # EnerGov UIs differ slightly. We try common patterns.
-            # Strategy:
-            #  1) Ensure we’re on a permit search screen
-            #  2) Find address search input(s)
-            #  3) Enter house + street (or full) and search
-            #  4) Parse first matching permit result rows for reroof/roof terms
-
-            # Attempt to locate a general search input
-            # (EnerGov often has a search box labeled "Address", "Search", etc.)
-            # We'll try multiple selectors.
             selectors = [
                 'input[placeholder*="Address" i]',
                 'input[aria-label*="Address" i]',
@@ -165,19 +171,26 @@ class EnerGovConnector:
                 except Exception:
                     pass
 
-            # Some EnerGov builds have separate "Street No" and "Street Name" fields
             street_no_sel = None
             street_name_sel = None
-            for sel in ['input[aria-label*="Street Number" i]', 'input[placeholder*="Street Number" i]', 'input[name*="streetno" i]']:
+            for sel in [
+                'input[aria-label*="Street Number" i]',
+                'input[placeholder*="Street Number" i]',
+                'input[name*="streetno" i]',
+            ]:
                 if page.query_selector(sel):
                     street_no_sel = sel
                     break
-            for sel in ['input[aria-label*="Street Name" i]', 'input[placeholder*="Street Name" i]', 'input[name*="streetname" i]']:
+
+            for sel in [
+                'input[aria-label*="Street Name" i]',
+                'input[placeholder*="Street Name" i]',
+                'input[name*="streetname" i]',
+            ]:
                 if page.query_selector(sel):
                     street_name_sel = sel
                     break
 
-            # Fill in the best-available fields
             query_used = ""
             if street_no_sel and street_name_sel:
                 page.fill(street_no_sel, house_no)
@@ -188,7 +201,6 @@ class EnerGovConnector:
                 box.fill(f"{house_no} {street}")
                 query_used = f"{house_no} {street}"
             else:
-                # As a last resort, type into any visible input
                 any_input = page.query_selector("input")
                 if not any_input:
                     return {"roof_detected": False, "error": "EnerGov page: no input fields found", "query_used": ""}
@@ -196,7 +208,6 @@ class EnerGovConnector:
                 any_input.fill(f"{house_no} {street}")
                 query_used = f"{house_no} {street}"
 
-            # Click a Search button if present (common)
             clicked = False
             for btn_sel in [
                 'button:has-text("Search")',
@@ -214,36 +225,27 @@ class EnerGovConnector:
                 except Exception:
                     pass
 
-            # If no explicit button, press Enter
             if not clicked:
                 page.keyboard.press("Enter")
 
-            # Wait for results area to update
-            # We avoid huge waits; if it doesn't load, we error clearly.
             time.sleep(1.0)
 
-            # Now parse results.
-            # We look for table rows / list items containing "ROOF" / "REROOF" / etc.
             roof_terms = ["ROOF", "REROOF", "RE-ROOF", "RE ROOF"]
             content = page.content().upper()
 
             if not any(t in content for t in roof_terms):
-                # Not necessarily an error; could be no permits
                 return {"roof_detected": False, "error": "", "query_used": query_used}
 
-            # Try to find a permit number-like token
             permit_no = ""
             m = re.search(r"\b(?:PERMIT|PMT)\s*#?\s*([A-Z0-9\-]{6,})\b", content)
             if m:
                 permit_no = m.group(1)
 
-            # Try to extract a date (mm/dd/yyyy) near roof terms
             roof_date = ""
             dm = re.search(r"\b(0?[1-9]|1[0-2])/(0?[1-9]|[12]\d|3[01])/(19|20)\d{2}\b", content)
             if dm:
                 roof_date = dm.group(0)
 
-            # Estimate roof years if we got a date
             roof_years = ""
             is_20plus = ""
             if roof_date:
@@ -257,7 +259,6 @@ class EnerGovConnector:
                 except Exception:
                     pass
 
-            # Type line: first roof-ish line
             type_line = ""
             for t in roof_terms:
                 if t in content:
