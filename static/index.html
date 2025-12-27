@@ -7,7 +7,6 @@
 
   <link rel="manifest" href="/static/manifest.webmanifest">
   <meta name="theme-color" content="#111111">
-
   <link rel="apple-touch-icon" href="/static/icon-512.png">
   <link rel="icon" type="image/png" sizes="192x192" href="/static/icon-192.png">
   <link rel="icon" type="image/png" sizes="512x512" href="/static/icon-512.png">
@@ -15,159 +14,36 @@
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 
   <style>
-    :root{
-      /* Desktop default: bigger map */
-      --mapH: 58vh;
-      --topPad: 10px;
-      --panelPad: 10px;
+    :root{ --mapH:58vh; --topPad:10px; --panelPad:10px; }
+    body{ margin:0; font-family:-apple-system,BlinkMacSystemFont,Arial,sans-serif; background:#fff; overflow:hidden; }
+    #top{ position:relative; padding:var(--topPad) 12px; display:flex; gap:10px; align-items:flex-start; border-bottom:1px solid #e5e5e5; flex-wrap:wrap; }
+    #logo{ position:absolute; top:8px; right:12px; display:flex; align-items:center; gap:8px; font-weight:800; pointer-events:none; user-select:none; }
+    #logo img{ width:34px; height:34px; border-radius:8px; border:1px solid #e6e6e6; background:#fff; }
+    #map{ height:var(--mapH); min-height:340px; }
+    #panel{ padding:var(--panelPad) 12px; border-top:1px solid #e5e5e5; display:flex; gap:10px; flex-wrap:wrap; align-items:flex-start; }
+    .box{ border:1px solid #e5e5e5; padding:10px; border-radius:12px; background:#fafafa; }
+    button{ padding:10px 12px; border-radius:12px; border:1px solid #ccc; background:#fff; cursor:pointer; white-space:nowrap; }
+    input,select{ padding:10px; border-radius:12px; border:1px solid #ccc; }
+    input[type="number"]{ width:86px; }
+    pre{ margin:0; white-space:pre-wrap; font-size:13px; line-height:1.35; }
+    .small{ font-size:12px; color:#444; margin-top:6px; }
+    .btnrow button{ margin-right:8px; margin-top:6px; }
+    .row{ display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+
+    @media (max-width:600px){
+      :root{ --mapH:34vh; --topPad:8px; --panelPad:8px; }
+      #map{ min-height:210px; }
+      #logo{ top:6px; right:8px; }
+      button,input,select{ padding:9px 10px; }
+      .box{ padding:9px; }
     }
 
-    body {
-      margin:0;
-      font-family: -apple-system, BlinkMacSystemFont, Arial, sans-serif;
-      background:#fff;
-      overflow:hidden; /* keep everything on one screen */
-    }
-
-    #top {
-      position: relative;
-      padding: var(--topPad) 12px;
-      display:flex;
-      gap:10px;
-      align-items:flex-start;
-      border-bottom:1px solid #e5e5e5;
-      flex-wrap:wrap;
-    }
-
-    /* Logo top-right */
-    #logo {
-      position:absolute;
-      top:8px;
-      right:12px;
-      display:flex;
-      align-items:center;
-      gap:8px;
-      font-weight:800;
-      color:#111;
-      letter-spacing:0.2px;
-      user-select:none;
-      pointer-events:none;
-    }
-    #logo img {
-      width:34px;
-      height:34px;
-      border-radius:8px;
-      border:1px solid #e6e6e6;
-      background:#fff;
-    }
-
-    #map {
-      height: var(--mapH);
-      min-height: 340px;
-    }
-
-    #panel {
-      padding: var(--panelPad) 12px;
-      border-top:1px solid #e5e5e5;
-      display:flex;
-      gap:10px;
-      flex-wrap:wrap;
-      align-items:flex-start;
-    }
-
-    .box {
-      border:1px solid #e5e5e5;
-      padding:10px;
-      border-radius:12px;
-      background:#fafafa;
-    }
-
-    button {
-      padding:10px 12px;
-      border-radius:12px;
-      border:1px solid #ccc;
-      background:#fff;
-      cursor:pointer;
-      white-space:nowrap;
-    }
-
-    input[type="number"] {
-      padding:10px;
-      width:86px;
-      border-radius:12px;
-      border:1px solid #ccc;
-    }
-
-    label { user-select:none; }
-
-    pre {
-      margin:0;
-      white-space:pre-wrap;
-      font-size:13px;
-      line-height:1.35;
-    }
-
-    .small { font-size:12px; color:#444; margin-top:6px; }
-    .btnrow button { margin-right:8px; margin-top:6px; }
-
-    /* PHONE: make map smaller so downloads are visible */
-    @media (max-width: 600px) {
-      :root{
-        --mapH: 34vh;
-        --topPad: 8px;
-        --panelPad: 8px;
-      }
-      #map { min-height: 210px; }
-      button { padding:9px 10px; }
-      .box { padding:9px; }
-      #logo { top:6px; right:8px; }
-    }
-
-    /* PDF Overlay */
-    #pdfOverlay {
-      position: fixed;
-      inset: 0;
-      background: rgba(0,0,0,0.60);
-      display: none;
-      z-index: 9999;
-    }
-
-    #pdfCard {
-      position: absolute;
-      inset: 10px;
-      background: #fff;
-      border-radius: 14px;
-      overflow: hidden;
-      display: flex;
-      flex-direction: column;
-      box-shadow: 0 10px 40px rgba(0,0,0,0.35);
-    }
-
-    #pdfTopbar {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 10px;
-      padding: 10px 12px;
-      border-bottom: 1px solid #e5e5e5;
-      background: #fafafa;
-    }
-
-    #pdfTitle {
-      font-weight: 800;
-      font-size: 14px;
-      color: #111;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-
-    #pdfFrame {
-      flex: 1;
-      width: 100%;
-      border: 0;
-      background: #fff;
-    }
+    /* PDF overlay */
+    #pdfOverlay{ position:fixed; inset:0; background:rgba(0,0,0,.6); display:none; z-index:9999; }
+    #pdfCard{ position:absolute; inset:10px; background:#fff; border-radius:14px; overflow:hidden; display:flex; flex-direction:column; box-shadow:0 10px 40px rgba(0,0,0,.35); }
+    #pdfTopbar{ display:flex; align-items:center; justify-content:space-between; gap:10px; padding:10px 12px; border-bottom:1px solid #e5e5e5; background:#fafafa; }
+    #pdfTitle{ font-weight:800; font-size:14px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    #pdfFrame{ flex:1; width:100%; border:0; }
   </style>
 
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
@@ -175,9 +51,15 @@
 
 <body>
   <div id="top">
-    <div id="logo">
-      <img src="/static/icon-192.png" alt="RoofSpy">
-      RoofSpy
+    <div id="logo"><img src="/static/icon-192.png" alt="RoofSpy">RoofSpy</div>
+
+    <div class="box">
+      <b>Florida Jurisdiction</b><br/>
+      <div class="row" style="margin-top:6px;">
+        <select id="jurisdiction"></select>
+        <button id="btnRefreshJ">Refresh</button>
+      </div>
+      <div class="small">Pick the city/county permit system to scan.</div>
     </div>
 
     <div class="box">
@@ -204,6 +86,21 @@
       <button id="btnStop">Stop</button>
       <div class="small">If errors spike: Delay 1.3–1.8</div>
     </div>
+
+    <div class="box">
+      <b>Add Jurisdiction</b>
+      <div class="small">Admin tool (EnerGov first).</div>
+      <div class="row" style="margin-top:6px;">
+        <input id="jName" placeholder="Name (e.g., City of X)" style="min-width:220px;">
+        <select id="jSystem">
+          <option value="energov">energov</option>
+        </select>
+      </div>
+      <div class="row" style="margin-top:6px;">
+        <input id="jUrl" placeholder="Permit portal URL" style="min-width:360px;">
+        <button id="btnAddJ">Add</button>
+      </div>
+    </div>
   </div>
 
   <div id="map"></div>
@@ -217,14 +114,11 @@
     </div>
   </div>
 
-  <!-- PDF Viewer Overlay -->
   <div id="pdfOverlay" role="dialog" aria-modal="true">
     <div id="pdfCard">
       <div id="pdfTopbar">
         <div id="pdfTitle">PDF</div>
-        <div>
-          <button id="btnPdfClose">Close</button>
-        </div>
+        <button id="btnPdfClose">Close</button>
       </div>
       <iframe id="pdfFrame" title="RoofSpy PDF Viewer"></iframe>
     </div>
@@ -232,194 +126,187 @@
 
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script>
-    if ('serviceWorker' in navigator) {
-      navigator.serviceWorker.register('/static/sw.js').catch(()=>{});
-    }
+    const KEY = new URLSearchParams(location.search).get("k") || "";
+    const statusEl = document.getElementById("status");
+    const downloadsEl = document.getElementById("downloads");
+    const jurSel = document.getElementById("jurisdiction");
 
-    const params = new URLSearchParams(location.search);
-    const KEY = params.get("k") || "";
-
-    function apiUrl(path) {
+    function apiUrl(path){
       const u = new URL(path, location.origin);
-      if (KEY) u.searchParams.set("k", KEY);
+      if(KEY) u.searchParams.set("k", KEY);
       return u.toString();
     }
 
-    const statusEl = document.getElementById('status');
-    const downloadsEl = document.getElementById('downloads');
-
     let holdUntil=0;
     function setStatus(msg, holdMs=0){
-      if (holdMs>0) holdUntil=Date.now()+holdMs;
+      if(holdMs) holdUntil = Date.now()+holdMs;
       statusEl.textContent = msg;
     }
 
-    // Map
-    const map = L.map('map').setView([26.7153, -80.0534], 12);
-    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-      maxZoom: 19,
-      attribution: '&copy; OpenStreetMap'
-    }).addTo(map);
-    setTimeout(() => { try { map.invalidateSize(); } catch(e){} }, 450);
+    // --- Jurisdictions ---
+    async function loadJurisdictions(){
+      jurSel.innerHTML = `<option>Loading…</option>`;
+      const r = await fetch(apiUrl("/api/jurisdictions"));
+      const j = await r.json();
+      if(!j.ok){ jurSel.innerHTML = `<option>Error</option>`; return; }
+      const items = j.jurisdictions || [];
+      jurSel.innerHTML = items.map(x => `<option value="${x.id}">${x.name} (${x.system})</option>`).join("");
+      if(items.length === 0) jurSel.innerHTML = `<option>No jurisdictions</option>`;
+    }
 
-    // Drawing state
+    document.getElementById("btnRefreshJ").onclick = loadJurisdictions;
+
+    document.getElementById("btnAddJ").onclick = async () => {
+      const name = document.getElementById("jName").value.trim();
+      const system = document.getElementById("jSystem").value.trim();
+      const portal_url = document.getElementById("jUrl").value.trim();
+      if(!name || !system || !portal_url){ alert("Fill name/system/url"); return; }
+
+      const r = await fetch(apiUrl("/api/jurisdictions/add"),{
+        method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body: JSON.stringify({ state:"FL", name, system, portal_url })
+      });
+      const j = await r.json();
+      if(!j.ok){ alert("Add failed: " + (j.error||"")); return; }
+      document.getElementById("jName").value = "";
+      document.getElementById("jUrl").value = "";
+      await loadJurisdictions();
+      setStatus("Added jurisdiction. Select it and test scan.", 3000);
+    };
+
+    // --- Map ---
+    const map = L.map("map").setView([26.7153,-80.0534],12);
+    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",{maxZoom:19, attribution:"&copy; OpenStreetMap"}).addTo(map);
+    setTimeout(()=>{ try{map.invalidateSize();}catch(e){} }, 450);
+
     let drawing=false, points=[], tempLine=null, finalPoly=null;
-    let lastPolygonLatLngs=null;  // <-- IMPORTANT: [[lat,lng],...]
-    let addresses=[];
+    let lastPolygonLatLngs=null; // [[lat,lng],...]
+    let parcels=[];
 
     function clearAll(){
-      drawing=false; points=[]; lastPolygonLatLngs=null; addresses=[];
-      downloadsEl.innerHTML='';
+      drawing=false; points=[]; lastPolygonLatLngs=null; parcels=[];
+      downloadsEl.innerHTML="";
       if(tempLine){ map.removeLayer(tempLine); tempLine=null; }
       if(finalPoly){ map.removeLayer(finalPoly); finalPoly=null; }
       setStatus("Cleared.", 1500);
     }
 
-    function startDrawing(){
-      clearAll();
-      drawing=true;
-      setStatus("Drawing… tap points then Finish.", 2500);
-    }
+    function startDrawing(){ clearAll(); drawing=true; setStatus("Drawing… tap points then Finish.", 2500); }
 
     function finishPolygon(){
-      if(!drawing){ alert("Tap Start first."); return; }
-      if(points.length < 3){ alert("Need 3+ points."); return; }
-
+      if(!drawing) return alert("Tap Start first");
+      if(points.length<3) return alert("Need 3+ points");
       drawing=false;
       if(tempLine){ map.removeLayer(tempLine); tempLine=null; }
-
-      finalPoly = L.polygon(points, {weight:2}).addTo(map);
-
-      // ✅ Convert Leaflet LatLng objects into [[lat,lng], ...] for backend
-      lastPolygonLatLngs = points.map(p => [p.lat, p.lng]);
-
+      finalPoly = L.polygon(points,{weight:2}).addTo(map);
+      lastPolygonLatLngs = points.map(p=>[p.lat,p.lng]);
       setStatus("Polygon saved. Tap Fetch.", 2500);
     }
 
-    map.on('click', (e)=>{
+    map.on("click",(e)=>{
       if(!drawing) return;
       points.push(e.latlng);
       if(tempLine) map.removeLayer(tempLine);
-      tempLine = L.polyline(points, {weight:2, dashArray:"6 6"}).addTo(map);
+      tempLine = L.polyline(points,{weight:2,dashArray:"6 6"}).addTo(map);
       setStatus(`Drawing… points: ${points.length}`, 1200);
     });
 
     async function fetchParcels(){
-      if(!lastPolygonLatLngs){
-        alert("Draw an area and press Finish first.");
-        return;
-      }
-      const limit = parseInt(document.getElementById('limit').value || "80", 10);
+      if(!lastPolygonLatLngs) return alert("Draw area then Finish.");
+      const limit = parseInt(document.getElementById("limit").value||"80",10);
       setStatus("Fetching parcel addresses…", 3000);
 
-      const r = await fetch(apiUrl("/api/parcels"), {
+      const r = await fetch(apiUrl("/api/parcels"),{
         method:"POST",
-        headers: {"Content-Type":"application/json"},
-        body: JSON.stringify({ latlngs: lastPolygonLatLngs, limit })
+        headers:{"Content-Type":"application/json"},
+        body: JSON.stringify({ latlngs:lastPolygonLatLngs, limit })
       });
-
-      const data = await r.json();
-      if(!data.ok){
-        setStatus("Error: " + (data.error || "unknown"), 6000);
-        return;
-      }
-
-      addresses = data.addresses || [];
-      setStatus(`Fetched ${addresses.length} addresses. Tap Start.`, 3500);
+      const j = await r.json();
+      if(!j.ok){ setStatus("Error: "+(j.error||"unknown"), 6000); return; }
+      parcels = j.parcels || [];
+      setStatus(`Fetched ${parcels.length} parcels. Tap Start.`, 3500);
     }
 
     async function startScan(){
-      if(!addresses.length){
-        alert("Fetch parcels first.");
-        return;
-      }
-      const delay = parseFloat(document.getElementById('delay').value || "1.2");
-      const fast_mode = document.getElementById('fastmode').checked;
+      if(!parcels.length) return alert("Fetch parcels first.");
+      const jurisdiction_id = parseInt(jurSel.value||"0",10);
+      if(!jurisdiction_id) return alert("Select a jurisdiction first.");
+
+      const delay = parseFloat(document.getElementById("delay").value||"1.2");
+      const fast_mode = document.getElementById("fastmode").checked;
+
       setStatus("Starting scan…", 2500);
-
-      const r = await fetch(apiUrl("/api/start"), {
+      const r = await fetch(apiUrl("/api/start"),{
         method:"POST",
-        headers: {"Content-Type":"application/json"},
-        body: JSON.stringify({ addresses, delay, fast_mode })
+        headers:{"Content-Type":"application/json"},
+        body: JSON.stringify({ jurisdiction_id, parcels, delay, fast_mode })
       });
-
-      const data = await r.json();
-      if(!data.ok){
-        setStatus("Error: " + (data.error || "unknown"), 6000);
-      }
+      const j = await r.json();
+      if(!j.ok){ setStatus("Error: "+(j.error||"unknown"), 6000); }
     }
 
     async function stopScan(){
-      await fetch(apiUrl("/api/stop"), { method:"POST" });
+      await fetch(apiUrl("/api/stop"),{method:"POST"});
       setStatus("Stopping…", 1500);
     }
 
-    // PDF Overlay
+    // PDF overlay
     const pdfOverlay = document.getElementById("pdfOverlay");
     const pdfFrame = document.getElementById("pdfFrame");
     const pdfTitle = document.getElementById("pdfTitle");
-    const btnPdfClose = document.getElementById("btnPdfClose");
-    let currentPdfUrl = "";
+    document.getElementById("btnPdfClose").onclick = () => {
+      pdfOverlay.style.display="none";
+      pdfFrame.src="about:blank";
+    };
+    pdfOverlay.addEventListener("click",(e)=>{
+      if(e.target===pdfOverlay){
+        pdfOverlay.style.display="none";
+        pdfFrame.src="about:blank";
+      }
+    });
 
-    function openPdfInOverlay(title, url) {
-      currentPdfUrl = url;
+    function openPdf(title, path){
       pdfTitle.textContent = title;
-      pdfFrame.src = url;
-      pdfOverlay.style.display = "block";
+      pdfFrame.src = apiUrl(path);
+      pdfOverlay.style.display="block";
     }
 
-    function closePdfOverlay() {
-      pdfOverlay.style.display = "none";
-      pdfFrame.src = "about:blank";
-      currentPdfUrl = "";
-    }
-
-    btnPdfClose.addEventListener("click", closePdfOverlay);
-    pdfOverlay.addEventListener("click", (e) => { if (e.target === pdfOverlay) closePdfOverlay(); });
-
-    function renderDownloadButtons() {
+    function renderDownloads(){
       downloadsEl.innerHTML = `
         <div class="btnrow">
           <button id="pdfAll">View ALL (PDF)</button>
           <button id="pdfGood">View GOOD 20+ (PDF)</button>
         </div>
       `;
-      document.getElementById("pdfAll").onclick = () => openPdfInOverlay("RoofSpy Results (ALL)", apiUrl("/download/all.pdf"));
-      document.getElementById("pdfGood").onclick = () => openPdfInOverlay("RoofSpy Results (GOOD 20+)", apiUrl("/download/good.pdf"));
+      document.getElementById("pdfAll").onclick = () => openPdf("RoofSpy Results (ALL)", "/download/all.pdf");
+      document.getElementById("pdfGood").onclick = () => openPdf("RoofSpy Results (GOOD 20+)", "/download/good.pdf");
     }
 
     async function poll(){
-      if(Date.now() < holdUntil) return;
-
+      if(Date.now()<holdUntil) return;
       const r = await fetch(apiUrl("/api/status"));
-      if (r.status === 401) {
-        setStatus("Unauthorized. Open the app using the link with ?k=YOUR_SECRET_KEY");
-        return;
-      }
+      if(r.status===401){ setStatus("Unauthorized. Use the link with ?k=YOUR_SECRET_KEY"); return; }
       const s = await r.json();
 
       if(s.running){
-        downloadsEl.innerHTML = "";
-        setStatus(`Running… ${s.done}/${s.total} | Good: ${s.good}\nStarted: ${s.started_at}\n${s.message || ""}`);
+        downloadsEl.innerHTML="";
+        setStatus(`Running… ${s.done}/${s.total} | Good: ${s.good}\n${s.message||""}`);
       } else if (s.message && s.message.startsWith("Done.")) {
-        // ✅ Your requested status line:
         setStatus(`Done. Number of good leads: ${s.good}`);
-        renderDownloadButtons();
-      } else {
-        if (!downloadsEl.innerHTML) {
-          downloadsEl.innerHTML = `<div class="small">Run a scan to enable downloads.</div>`;
-        }
+        renderDownloads();
       }
     }
 
-    document.getElementById('btnDraw').addEventListener('click', startDrawing);
-    document.getElementById('btnFinish').addEventListener('click', finishPolygon);
-    document.getElementById('btnClear').addEventListener('click', clearAll);
-    document.getElementById('btnFetch').addEventListener('click', fetchParcels);
-    document.getElementById('btnStart').addEventListener('click', startScan);
-    document.getElementById('btnStop').addEventListener('click', stopScan);
+    document.getElementById("btnDraw").onclick = startDrawing;
+    document.getElementById("btnFinish").onclick = finishPolygon;
+    document.getElementById("btnClear").onclick = clearAll;
+    document.getElementById("btnFetch").onclick = fetchParcels;
+    document.getElementById("btnStart").onclick = startScan;
+    document.getElementById("btnStop").onclick = stopScan;
 
-    setInterval(poll, 1500);
+    setInterval(poll,1500);
+    loadJurisdictions();
   </script>
 </body>
 </html>
