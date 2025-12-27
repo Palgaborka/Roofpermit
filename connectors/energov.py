@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import re
-import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, Tuple
@@ -44,46 +43,12 @@ def parse_address_for_search(raw: str) -> Tuple[str, str]:
 
 
 # -----------------------------
-# Playwright singleton
-# -----------------------------
-_pw_lock = threading.Lock()
-_pw = None
-_browser = None
-_context = None
-
-def _get_context():
-    global _pw, _browser, _context
-    with _pw_lock:
-        if _context:
-            return _context
-
-        _pw = sync_playwright().start()
-        _browser = _pw.chromium.launch(headless=True)
-        _context = _browser.new_context(
-            viewport={"width": 1280, "height": 800},
-            user_agent="RoofSpy/1.0",
-        )
-
-        def block(route, request):
-            if request.resource_type in ("image", "media", "font"):
-                route.abort()
-            else:
-                route.continue_()
-
-        _context.route("**/*", block)
-        return _context
-
-
-# -----------------------------
-# EnerGov Connector
+# EnerGov Connector (THREAD SAFE)
 # -----------------------------
 def _extract_url(obj: Any) -> str:
     if isinstance(obj, str):
         return obj
-    url = getattr(obj, "portal_url", "")
-    if not isinstance(url, str):
-        raise ValueError("Invalid EnerGov portal URL")
-    return url
+    return getattr(obj, "portal_url", "")
 
 
 @dataclass
@@ -92,6 +57,8 @@ class EnerGovConnector:
 
     def __post_init__(self):
         self.portal_url = _extract_url(self.portal)
+        if not self.portal_url.startswith("http"):
+            raise ValueError("Invalid EnerGov portal URL")
 
     def search_roof(self, address: str) -> Dict[str, Any]:
         try:
@@ -99,71 +66,73 @@ class EnerGovConnector:
         except Exception as e:
             return {"roof_detected": False, "error": str(e), "query_used": ""}
 
-        ctx = _get_context()
-        page = ctx.new_page()
-        page.set_default_timeout(30000)
-
         try:
-            # ---- CRITICAL FIX ----
-            page.goto(self.portal_url, wait_until="domcontentloaded")
-            try:
-                page.wait_for_url("**/search*", timeout=20000)
-            except Exception:
-                pass
-            page.wait_for_selector("input", timeout=20000)
-            time.sleep(0.6)
+            with sync_playwright() as pw:
+                browser = pw.chromium.launch(headless=True)
+                context = browser.new_context(
+                    viewport={"width": 1280, "height": 800},
+                    user_agent="RoofSpy/1.0",
+                )
 
-            # Find input
-            box = page.query_selector("input")
-            if not box:
-                return {"roof_detected": False, "error": "EnerGov page: no input fields found", "query_used": ""}
+                page = context.new_page()
+                page.set_default_timeout(30000)
 
-            box.fill(f"{house} {street}")
-            page.keyboard.press("Enter")
-            time.sleep(1.2)
+                # --- EnerGov SPA load ---
+                page.goto(self.portal_url, wait_until="domcontentloaded")
+                try:
+                    page.wait_for_url("**/search*", timeout=20000)
+                except Exception:
+                    pass
 
-            content = page.content().upper()
-            roof_terms = ["ROOF", "REROOF", "RE-ROOF"]
+                page.wait_for_selector("input", timeout=20000)
+                time.sleep(0.6)
 
-            if not any(t in content for t in roof_terms):
-                return {"roof_detected": False, "error": "", "query_used": f"{house} {street}"}
+                box = page.query_selector("input")
+                if not box:
+                    return {"roof_detected": False, "error": "EnerGov page: no input fields found", "query_used": ""}
 
-            permit = ""
-            m = re.search(r"\b[A-Z]{0,3}\d{4,}-?\d*\b", content)
-            if m:
-                permit = m.group(0)
+                query = f"{house} {street}"
+                box.fill(query)
+                page.keyboard.press("Enter")
+                time.sleep(1.2)
 
-            date = ""
-            d = re.search(r"\b\d{1,2}/\d{1,2}/\d{4}\b", content)
-            if d:
-                date = d.group(0)
+                content = page.content().upper()
+                roof_terms = ["ROOF", "REROOF", "RE-ROOF"]
 
-            years = ""
-            is_20 = ""
-            if date:
-                import datetime
-                mm, dd, yy = date.split("/")
-                yrs = (datetime.date.today() - datetime.date(int(yy), int(mm), int(dd))).days / 365.25
-                years = f"{yrs:.1f}"
-                is_20 = "True" if yrs >= 20 else "False"
+                if not any(t in content for t in roof_terms):
+                    return {"roof_detected": False, "error": "NO_ROOF_PERMIT_FOUND", "query_used": query}
 
-            return {
-                "roof_detected": True,
-                "query_used": f"{house} {street}",
-                "permit_no": permit,
-                "type_line": "ROOF",
-                "roof_date": date,
-                "issued": "",
-                "finalized": "",
-                "applied": "",
-                "roof_years": years,
-                "is_20plus": is_20,
-                "error": "",
-            }
+                permit = ""
+                m = re.search(r"\b[A-Z]{0,3}\d{4,}-?\d*\b", content)
+                if m:
+                    permit = m.group(0)
+
+                date = ""
+                d = re.search(r"\b\d{1,2}/\d{1,2}/\d{4}\b", content)
+                if d:
+                    date = d.group(0)
+
+                years = ""
+                is_20 = ""
+                if date:
+                    import datetime
+                    mm, dd, yy = date.split("/")
+                    yrs = (datetime.date.today() - datetime.date(int(yy), int(mm), int(dd))).days / 365.25
+                    years = f"{yrs:.1f}"
+                    is_20 = "True" if yrs >= 20 else "False"
+
+                return {
+                    "roof_detected": True,
+                    "query_used": query,
+                    "permit_no": permit,
+                    "type_line": "ROOF",
+                    "roof_date": date,
+                    "roof_years": years,
+                    "is_20plus": is_20,
+                    "error": "",
+                }
 
         except PWTimeoutError:
             return {"roof_detected": False, "error": "EnerGov timeout", "query_used": f"{house} {street}"}
         except Exception as e:
             return {"roof_detected": False, "error": f"EnerGov error: {e}", "query_used": f"{house} {street}"}
-        finally:
-            page.close()
