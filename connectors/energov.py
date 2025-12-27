@@ -6,6 +6,7 @@ import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse, urlunparse
 
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
 
@@ -26,12 +27,13 @@ def _get_context():
 
         _pw = sync_playwright().start()
         _browser = _pw.chromium.launch(headless=True)
+
         _context = _browser.new_context(
             viewport={"width": 1400, "height": 900},
             user_agent="RoofSpy/1.0",
         )
 
-        # Block heavy assets
+        # Block only heavy assets (keep scripts!)
         def route_handler(route, request):
             if request.resource_type in ("image", "media", "font"):
                 route.abort()
@@ -43,9 +45,45 @@ def _get_context():
 
 
 # ============================================================
+# West Palm Beach EnerGov URL normalizer
+# ============================================================
+_WPB_SEARCH_FRAGMENT = "/search?m=2&ps=10&pn=1&em=true"
+
+def _ensure_wpb_search_url(url: str) -> str:
+    """
+    WPB EnerGov is an SPA. If you load only '#/search' without params,
+    some sessions won't render the permit search UI as expected.
+
+    This function forces:
+      ...#/search?m=2&ps=10&pn=1&em=true
+    """
+    url = (url or "").strip()
+    if not url:
+        return url
+
+    p = urlparse(url)
+    frag = p.fragment or ""
+
+    # If fragment already contains /search with params, keep it
+    if "search?m=" in frag.lower():
+        return url
+
+    # If fragment is exactly '/search' or contains 'search' without params, force params
+    if "search" in frag.lower():
+        # normalize to /search?... even if it was /search or /search&...
+        frag = _WPB_SEARCH_FRAGMENT
+        return urlunparse((p.scheme, p.netloc, p.path, p.params, p.query, frag))
+
+    # If no fragment at all, append the correct one
+    frag = _WPB_SEARCH_FRAGMENT
+    return urlunparse((p.scheme, p.netloc, p.path, p.params, p.query, frag))
+
+
+# ============================================================
 # Address normalization (safe)
 # ============================================================
 _UNIT_MARKERS = r"(?:APT|UNIT|STE|SUITE|#)"
+
 def _clean_spaces(s: str) -> str:
     s = (s or "").replace(",", " ")
     s = re.sub(r"\s+", " ", s).strip()
@@ -53,22 +91,21 @@ def _clean_spaces(s: str) -> str:
 
 def normalize_address(raw: str) -> str:
     s = _clean_spaces(raw).upper()
-    # Drop trailing "FL ...." if present
     s = re.sub(r"\bFL\b.*$", "", s).strip()
-    # Drop unit markers
     s = re.sub(rf"\b{_UNIT_MARKERS}\b.*$", "", s).strip()
     return s
 
 
 # ============================================================
-# Helpers: date + permit extraction
+# Row-level extract helpers
 # ============================================================
 _DATE_RE = re.compile(r"\b(0?[1-9]|1[0-2])/(0?[1-9]|[12]\d|3[01])/(19|20)\d{2}\b")
 _PERMIT_RE = re.compile(r"\b[A-Z]{0,4}\d{3,}(?:-\d+)?\b")
 
 _ROOF_TERMS = (
-    "ROOF", "REROOF", "RE-ROOF", "RE ROOF",
-    "ROOFING", "ROOF REPLAC", "REROOFING",
+    "REROOF", "RE-ROOF", "RE ROOF",
+    "ROOF REPLAC", "ROOF REPLACE", "ROOFING",
+    "ROOF",
 )
 
 def _parse_date(mmddyyyy: str) -> Optional[_dt.date]:
@@ -84,7 +121,7 @@ def _extract_permit_no(text: str) -> str:
 
 
 # ============================================================
-# EnerGov Connector (West Palm Beach focused)
+# EnerGov Connector (WPB-focused)
 # ============================================================
 @dataclass
 class EnerGovConnector:
@@ -92,9 +129,11 @@ class EnerGovConnector:
 
     def __post_init__(self):
         if isinstance(self.portal, str):
-            self.portal_url = self.portal.strip()
+            raw = self.portal.strip()
         else:
-            self.portal_url = (getattr(self.portal, "portal_url", "") or "").strip()
+            raw = (getattr(self.portal, "portal_url", "") or "").strip()
+
+        self.portal_url = _ensure_wpb_search_url(raw)
 
         if not self.portal_url.startswith("http"):
             raise ValueError("Invalid EnerGov portal URL")
@@ -106,146 +145,157 @@ class EnerGovConnector:
 
         ctx = _get_context()
         page = ctx.new_page()
-        page.set_default_timeout(35000)
+        page.set_default_timeout(45000)
 
         try:
-            # 1) Load WPB search page
+            # 1) Load the *correct* search URL (forced params)
             page.goto(self.portal_url, wait_until="domcontentloaded")
 
-            # Give SPA a moment
-            time.sleep(0.8)
+            # 2) Wait for SPA to render inputs (this fixes "no input fields found")
+            # We wait for ANY visible, enabled input.
+            page.wait_for_function(
+                """
+                () => {
+                  const inputs = Array.from(document.querySelectorAll('input'));
+                  return inputs.some(i => {
+                    const r = i.getBoundingClientRect();
+                    const visible = r.width > 0 && r.height > 0;
+                    const notHidden = i.type !== 'hidden';
+                    const notDisabled = !i.disabled;
+                    return visible && notHidden && notDisabled;
+                  });
+                }
+                """,
+                timeout=35000,
+            )
 
-            # 2) Find a usable search box (EnerGov variations)
+            # Small settle for Angular rendering
+            time.sleep(0.6)
+
+            # 3) Pick best search input
+            # WPB EnerGov often has multiple inputs; choose first visible.
             search_box = None
-            candidates = [
+            for sel in [
                 'input[type="search"]',
                 'input[placeholder*="Search" i]',
                 'input[placeholder*="Address" i]',
                 'input[aria-label*="Search" i]',
                 'input[aria-label*="Address" i]',
                 'input',
-            ]
-            for sel in candidates:
-                try:
-                    el = page.query_selector(sel)
-                    if el:
-                        # make sure visible/enabled-ish
+            ]:
+                loc = page.locator(sel)
+                if loc.count() > 0:
+                    for i in range(min(loc.count(), 12)):
+                        el = loc.nth(i)
                         try:
-                            if el.is_visible():
+                            if el.is_visible() and el.is_enabled():
                                 search_box = el
                                 break
                         except Exception:
-                            search_box = el
-                            break
-                except Exception:
-                    pass
+                            continue
+                if search_box is not None:
+                    break
 
-            if not search_box:
-                return {"roof_detected": False, "error": "EnerGov page: no input fields found", "query_used": query_used}
+            if search_box is None:
+                return {
+                    "roof_detected": False,
+                    "error": "EnerGov page: no input fields found",
+                    "query_used": query_used,
+                }
 
-            # 3) Run search
+            # 4) Enter address and submit
             search_box.click()
             search_box.fill(query_used)
             page.keyboard.press("Enter")
 
-            # 4) Wait for results: anchor on "Roof date" column header (you confirmed it exists)
-            # If it never appears, the results grid didn't load / selector changed.
+            # 5) Wait for results to appear.
+            # We anchor on "Roof date" header text (you confirmed it exists).
+            # If it doesn’t show quickly, we still try to parse rows after a delay.
             try:
                 page.wait_for_selector("text=/Roof\\s*date/i", timeout=25000)
             except Exception:
-                # Sometimes the grid loads without that exact text; fallback to any rows
                 pass
 
-            time.sleep(1.0)
+            time.sleep(1.2)
 
-            # 5) Locate the grid/container near "Roof date"
-            grid_handle = None
+            # 6) Find a likely results container
+            # Prefer a grid/table ancestor near "Roof date".
+            grid = None
             try:
-                # Try to find the header element
                 hdr = page.locator("text=/Roof\\s*date/i").first
-                # climb to a likely grid/table container
-                grid = hdr.locator(
-                    "xpath=ancestor::*[self::table or @role='grid' or @role='table' or contains(@class,'mat-table') or contains(@class,'mat-mdc-table') or contains(@class,'ag-root') or contains(@class,'grid')][1]"
+                cand = hdr.locator(
+                    "xpath=ancestor::*[self::table or @role='grid' or @role='table' or contains(@class,'table') or contains(@class,'grid') or contains(@class,'mat-table') or contains(@class,'mat-mdc-table')][1]"
                 )
-                if grid.count() > 0:
-                    grid_handle = grid.first
+                if cand.count() > 0:
+                    grid = cand.first
             except Exception:
-                grid_handle = None
+                grid = None
 
-            # Fallback: pick the biggest visible table/grid-ish thing
-            if grid_handle is None:
-                # try table
-                t = page.locator("table").first
-                if t.count() > 0:
-                    grid_handle = t
-                else:
-                    # try any grid role
-                    g = page.locator("[role='grid'], [role='table']").first
-                    if g.count() > 0:
-                        grid_handle = g
+            if grid is None:
+                # fallback to any table/grid role
+                cand = page.locator("[role='grid'], [role='table'], table").first
+                if cand.count() > 0:
+                    grid = cand
 
-            if grid_handle is None:
-                return {"roof_detected": False, "error": "EnerGov: results grid not found", "query_used": query_used}
+            if grid is None:
+                return {
+                    "roof_detected": False,
+                    "error": "EnerGov: results grid not found",
+                    "query_used": query_used,
+                }
 
-            # 6) Force-render rows (virtualized grids need scroll)
-            # We scroll a few times; if scroll fails, we still attempt a read.
-            for _ in range(6):
+            # 7) Scroll to force virtualization to render rows
+            for _ in range(8):
                 try:
-                    grid_handle.evaluate("el => { el.scrollBy(0, el.scrollHeight); }")
+                    grid.evaluate("el => { el.scrollBy(0, el.scrollHeight); }")
                 except Exception:
                     try:
-                        page.mouse.wheel(0, 1200)
+                        page.mouse.wheel(0, 1400)
                     except Exception:
                         pass
-                time.sleep(0.35)
+                time.sleep(0.30)
 
-            # 7) Collect row texts from within the grid (row-level parsing)
-            row_loc = grid_handle.locator(
-                "xpath=.//*[self::tr or @role='row' or contains(@class,'mat-row') or contains(@class,'mat-mdc-row') or contains(@class,'ag-row') or contains(@class,'row')]"
+            # 8) Collect row-like elements from inside the grid
+            row_loc = grid.locator(
+                "xpath=.//*[self::tr or @role='row' or contains(@class,'mat-row') or contains(@class,'mat-mdc-row') or contains(@class,'row')][.//text()]"
             )
             row_count = row_loc.count()
 
-            # Sometimes the “row” elements are actually div cards; add fallback card selector
-            card_loc = grid_handle.locator("xpath=.//*[contains(@class,'card') or contains(@class,'result') or contains(@class,'item')]")
-            card_count = card_loc.count()
+            # As a secondary fallback, collect “cards/items”
+            if row_count == 0:
+                row_loc = grid.locator(
+                    "xpath=.//*[contains(@class,'card') or contains(@class,'item') or contains(@class,'result')][.//text()]"
+                )
+                row_count = row_loc.count()
 
-            texts: List[str] = []
-            if row_count > 0:
-                for i in range(min(row_count, 120)):  # cap
-                    try:
-                        txt = row_loc.nth(i).inner_text(timeout=2000)
-                        txt = (txt or "").strip()
-                        if txt:
-                            texts.append(txt)
-                    except Exception:
-                        continue
-            elif card_count > 0:
-                for i in range(min(card_count, 120)):  # cap
-                    try:
-                        txt = card_loc.nth(i).inner_text(timeout=2000)
-                        txt = (txt or "").strip()
-                        if txt:
-                            texts.append(txt)
-                    except Exception:
-                        continue
+            if row_count == 0:
+                return {
+                    "roof_detected": False,
+                    "error": "EnerGov: no result rows detected",
+                    "query_used": query_used,
+                }
 
-            if not texts:
-                return {"roof_detected": False, "error": "EnerGov: no result rows detected", "query_used": query_used}
-
-            # 8) Filter roofing permits + extract row-scoped roof date
+            # 9) Parse rows: filter roofing + get row-scoped roof date
             roofing: List[Tuple[_dt.date, str, str]] = []  # (date, permit_no, type_line)
 
-            for t in texts:
-                up = t.upper()
+            max_rows = min(row_count, 140)
+            for i in range(max_rows):
+                try:
+                    txt = row_loc.nth(i).inner_text(timeout=2500)
+                except Exception:
+                    continue
+
+                if not txt:
+                    continue
+
+                up = txt.upper()
 
                 if not any(k in up for k in _ROOF_TERMS):
                     continue
 
-                # Row-scoped date: take the most relevant date in THIS ROW
-                dates = _DATE_RE.findall(up)
-                # findall returns tuples because of groups; re-find with finditer
+                # row-scoped dates only
                 dvals = [m.group(0) for m in _DATE_RE.finditer(up)]
-                row_dates: List[_dt.date] = []
+                row_dates = []
                 for dv in dvals:
                     dd = _parse_date(dv)
                     if dd:
@@ -254,19 +304,22 @@ class EnerGovConnector:
                 if not row_dates:
                     continue
 
-                # WPB has a “Roof date” column; usually only one date per row.
-                # If multiple dates exist, choose the latest date in the row.
+                # In WPB, the "Roof date" is typically the key date in row;
+                # if multiple, choose latest within row.
                 best_date = max(row_dates)
 
                 permit_no = _extract_permit_no(up)
                 type_line = "REROOF" if ("REROOF" in up or "RE-ROOF" in up or "RE ROOF" in up) else "ROOF"
-
                 roofing.append((best_date, permit_no, type_line))
 
             if not roofing:
-                return {"roof_detected": False, "error": "NO_ROOF_PERMIT_FOUND", "query_used": query_used}
+                return {
+                    "roof_detected": False,
+                    "error": "NO_ROOF_PERMIT_FOUND",
+                    "query_used": query_used,
+                }
 
-            # 9) Choose most recent roofing permit
+            # 10) Select most recent roofing permit for roof age
             roofing.sort(key=lambda x: x[0], reverse=True)
             roof_date, permit_no, type_line = roofing[0]
 
@@ -286,9 +339,17 @@ class EnerGovConnector:
             }
 
         except PWTimeoutError:
-            return {"roof_detected": False, "error": "EnerGov timeout loading/searching", "query_used": query_used}
+            return {
+                "roof_detected": False,
+                "error": "EnerGov timeout loading/searching",
+                "query_used": query_used,
+            }
         except Exception as e:
-            return {"roof_detected": False, "error": f"EnerGov error: {type(e).__name__}: {e}", "query_used": query_used}
+            return {
+                "roof_detected": False,
+                "error": f"EnerGov error: {type(e).__name__}: {e}",
+                "query_used": query_used,
+            }
         finally:
             try:
                 page.close()
