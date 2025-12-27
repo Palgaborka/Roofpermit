@@ -1,12 +1,15 @@
+# app.py
+
 import csv
 import os
+import re
 import threading
 import time
 import random
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, Form
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
@@ -19,6 +22,12 @@ from reportlab.lib.pagesizes import letter, landscape
 from reportlab.pdfgen import canvas
 from reportlab.lib.units import inch
 
+# URL-onboarding helpers (detection + optional reachability)
+from jurisdiction_onboard import (
+    detect_system_from_url,
+    validate_url_reachable,
+)
+
 SECRET_KEY = os.environ.get("SECRET_KEY", "").strip() or "CHANGE_ME"
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -27,11 +36,14 @@ STATIC_DIR = Path(__file__).parent / "static"
 app = FastAPI(title="RoofSpy (Florida-Ready)")
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
+
 def require_key(request: Request):
     k = request.query_params.get("k") or request.headers.get("x-app-key") or ""
     if k != SECRET_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
+
+# Seed default jurisdictions on startup
 seed_default()
 
 scan_lock = threading.Lock()
@@ -52,6 +64,7 @@ scan_rows: List[LeadRow] = []
 _last_all_csv: Optional[Path] = None
 _last_good_csv: Optional[Path] = None
 
+
 def write_csv(path: Path, rows: List[LeadRow]):
     with path.open("w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
@@ -68,6 +81,7 @@ def write_csv(path: Path, rows: List[LeadRow]):
                 r.roof_date_used, r.issued, r.finalized, r.applied,
                 r.roof_years, r.is_20plus, r.status, r.seconds
             ])
+
 
 def rows_to_pdf_bytes(rows: List[LeadRow], title: str) -> bytes:
     from io import BytesIO
@@ -87,7 +101,7 @@ def rows_to_pdf_bytes(rows: List[LeadRow], title: str) -> bytes:
 
     y = top - 42
 
-    headers = ["Address", "Owner", "Mailing", "Phone", "Roof Date", "Years", "20+?","Permit #", "Type", "Status"]
+    headers = ["Address", "Owner", "Mailing", "Phone", "Roof Date", "Years", "20+?", "Permit #", "Type", "Status"]
     col_x = [
         left,            # Address
         left + 230,      # Owner
@@ -103,7 +117,7 @@ def rows_to_pdf_bytes(rows: List[LeadRow], title: str) -> bytes:
 
     def clip(s: str, maxlen: int) -> str:
         s = (s or "")
-        return s if len(s) <= maxlen else (s[:maxlen-1] + "…")
+        return s if len(s) <= maxlen else (s[:maxlen - 1] + "…")
 
     def draw_row(vals, bold=False):
         nonlocal y
@@ -136,6 +150,117 @@ def rows_to_pdf_bytes(rows: List[LeadRow], title: str) -> bytes:
 
     c.save()
     return buf.getvalue()
+
+
+# ---------------------------
+# Jurisdiction Onboarding UI
+# ---------------------------
+
+@app.get("/jurisdictions/onboard", response_class=HTMLResponse)
+def onboard_form(request: Request):
+    require_key(request)
+    return """
+    <html>
+      <head>
+        <title>RoofSpy - Add Jurisdiction</title>
+        <style>
+          body{font-family:Arial, sans-serif; max-width:900px; margin:40px auto; padding:0 16px;}
+          input, button{font-size:16px; padding:10px; width:100%;}
+          .row{margin:14px 0;}
+          .small{color:#666; font-size:13px;}
+          code{background:#f2f2f2; padding:2px 6px; border-radius:6px;}
+        </style>
+      </head>
+      <body>
+        <h2>Add a City / Jurisdiction</h2>
+        <p class="small">Paste a permit search URL. We auto-detect <b>EnerGov</b> vs <b>ArcGIS</b> and save it to your jurisdiction list.</p>
+
+        <form method="post" action="/jurisdictions/onboard">
+          <div class="row">
+            <label>Permit search URL</label><br/>
+            <input name="url" placeholder="https://...#/search?m=2&ps=10&pn=1&em=true" />
+          </div>
+
+          <div class="row">
+            <label>State (default FL)</label><br/>
+            <input name="state" value="FL" />
+          </div>
+
+          <div class="row">
+            <label>Optional City Display Name (leave blank to auto)</label><br/>
+            <input name="display_name" placeholder="CAPE CORAL" />
+          </div>
+
+          <div class="row">
+            <button type="submit">Detect & Save</button>
+          </div>
+        </form>
+
+        <p class="small">
+          Tip: after saving, refresh your main app page; the city should appear in the jurisdiction dropdown.
+        </p>
+      </body>
+    </html>
+    """
+
+
+@app.post("/jurisdictions/onboard", response_class=HTMLResponse)
+def onboard_submit(
+    request: Request,
+    url: str = Form(...),
+    state: str = Form("FL"),
+    display_name: str = Form(""),
+):
+    require_key(request)
+
+    try:
+        detected = detect_system_from_url(url)
+
+        # allow overrides
+        detected.state = (state or detected.state or "FL").strip().upper()
+        if display_name.strip():
+            detected.display_name = display_name.strip()
+
+        # lightweight reachability check (does not guarantee API works, just that URL responds)
+        validation = validate_url_reachable(url)
+
+        # IMPORTANT: Save into your existing jurisdictions DB/registry so IDs stay numeric
+        # This keeps /api/start working (it expects int jurisdiction_id)
+        new_id = add_jurisdiction(
+            detected.state,
+            detected.display_name,
+            detected.system,
+            detected.base_url,
+            active=1
+        )
+
+        return f"""
+        <html><body style="font-family:Arial; max-width:900px; margin:40px auto; padding:0 16px;">
+          <h2>Saved ✅</h2>
+          <p><b>ID:</b> {new_id}</p>
+          <p><b>Name:</b> {detected.display_name}</p>
+          <p><b>State:</b> {detected.state}</p>
+          <p><b>System:</b> {detected.system}</p>
+          <p><b>Base URL:</b> <a href="{detected.base_url}">{detected.base_url}</a></p>
+          <p><b>Reachable check:</b> {validation}</p>
+
+          <p><a href="/jurisdictions/onboard">Add another</a></p>
+          <p><a href="/?k={SECRET_KEY}">Go to app home</a></p>
+        </body></html>
+        """
+    except Exception as e:
+        return f"""
+        <html><body style="font-family:Arial; max-width:900px; margin:40px auto; padding:0 16px;">
+          <h2>Error</h2>
+          <p>{str(e)}</p>
+          <p><a href="/jurisdictions/onboard">Go back</a></p>
+        </body></html>
+        """
+
+
+# ---------------------------
+# Scanning logic
+# ---------------------------
 
 def run_scan(parcels: List[Dict[str, str]], jurisdiction_id: int, delay_seconds: float, fast_mode: bool):
     global scan_stop_flag, _last_all_csv, _last_good_csv
@@ -295,16 +420,23 @@ def run_scan(parcels: List[Dict[str, str]], jurisdiction_id: int, delay_seconds:
         _last_all_csv = all_path
         _last_good_csv = good_path
 
+
+# ---------------------------
+# Routes / API
+# ---------------------------
+
 @app.get("/", response_class=HTMLResponse)
 def root(request: Request):
     require_key(request)
     return HTMLResponse((STATIC_DIR / "index.html").read_text(encoding="utf-8"))
+
 
 @app.get("/api/jurisdictions")
 def api_jurisdictions(request: Request):
     require_key(request)
     items = list_active("FL")
     return JSONResponse({"ok": True, "jurisdictions": [j.__dict__ for j in items]})
+
 
 @app.post("/api/jurisdictions/add")
 async def api_jurisdictions_add(request: Request):
@@ -322,11 +454,13 @@ async def api_jurisdictions_add(request: Request):
     new_id = add_jurisdiction(state, name, system, portal_url, active=1)
     return JSONResponse({"ok": True, "id": new_id})
 
+
 @app.get("/api/status")
 def api_status(request: Request):
     require_key(request)
     with scan_lock:
         return JSONResponse(dict(scan_status))
+
 
 @app.post("/api/parcels")
 async def api_parcels(request: Request):
@@ -341,6 +475,7 @@ async def api_parcels(request: Request):
         return JSONResponse({"ok": True, "parcels": parcels})
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)})
+
 
 @app.post("/api/start")
 async def api_start(request: Request):
@@ -369,6 +504,7 @@ async def api_start(request: Request):
     scan_thread.start()
     return JSONResponse({"ok": True})
 
+
 @app.post("/api/stop")
 def api_stop(request: Request):
     global scan_stop_flag
@@ -378,6 +514,7 @@ def api_stop(request: Request):
         scan_status["message"] = "Stopping…"
     return JSONResponse({"ok": True})
 
+
 @app.get("/download/all.pdf")
 def download_all_pdf(request: Request):
     require_key(request)
@@ -386,8 +523,12 @@ def download_all_pdf(request: Request):
     if not rows_copy:
         raise HTTPException(404, "No results in memory yet. Run a scan first.")
     pdf = rows_to_pdf_bytes(rows_copy, title="RoofSpy Results (ALL)")
-    return Response(content=pdf, media_type="application/pdf",
-                    headers={"Content-Disposition": "inline; filename=roofspy_all.pdf"})
+    return Response(
+        content=pdf,
+        media_type="application/pdf",
+        headers={"Content-Disposition": "inline; filename=roofspy_all.pdf"},
+    )
+
 
 @app.get("/download/good.pdf")
 def download_good_pdf(request: Request):
@@ -397,8 +538,12 @@ def download_good_pdf(request: Request):
     if not rows_copy:
         raise HTTPException(404, "No 20+ year leads in memory yet. Run a scan first.")
     pdf = rows_to_pdf_bytes(rows_copy, title="RoofSpy Results (GOOD 20+)")
-    return Response(content=pdf, media_type="application/pdf",
-                    headers={"Content-Disposition": "inline; filename=roofspy_good_20plus.pdf"})
+    return Response(
+        content=pdf,
+        media_type="application/pdf",
+        headers={"Content-Disposition": "inline; filename=roofspy_good_20plus.pdf"},
+    )
+
 
 @app.get("/download/all")
 def download_all(request: Request):
@@ -406,6 +551,7 @@ def download_all(request: Request):
     if not _last_all_csv or not _last_all_csv.exists():
         raise HTTPException(404, "No CSV available yet.")
     return FileResponse(str(_last_all_csv), filename=_last_all_csv.name)
+
 
 @app.get("/download/good")
 def download_good(request: Request):
