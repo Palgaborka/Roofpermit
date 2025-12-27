@@ -1,3 +1,5 @@
+import os, sys
+sys.path.append(os.path.dirname(__file__))
 from __future__ import annotations
 import csv
 import os
