@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import datetime
+import datetime as _dt
 import re
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
 
@@ -26,7 +26,6 @@ def _get_context():
 
         _pw = sync_playwright().start()
         _browser = _pw.chromium.launch(headless=True)
-
         _context = _browser.new_context(
             viewport={"width": 1400, "height": 900},
             user_agent="RoofSpy/1.0",
@@ -44,183 +43,254 @@ def _get_context():
 
 
 # ============================================================
-# Address parsing (WPB-safe)
+# Address normalization (safe)
 # ============================================================
-def _clean(s: str) -> str:
+_UNIT_MARKERS = r"(?:APT|UNIT|STE|SUITE|#)"
+def _clean_spaces(s: str) -> str:
     s = (s or "").replace(",", " ")
-    s = re.sub(r"\s+", " ", s)
-    return s.strip()
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
-def parse_address(raw: str) -> str:
-    """
-    West Palm Beach EnerGov accepts full address strings.
-    We normalize but do NOT over-trim.
-    """
-    s = _clean(raw).upper()
-    s = re.sub(r"\bFL\b.*$", "", s)
+def normalize_address(raw: str) -> str:
+    s = _clean_spaces(raw).upper()
+    # Drop trailing "FL ...." if present
+    s = re.sub(r"\bFL\b.*$", "", s).strip()
+    # Drop unit markers
+    s = re.sub(rf"\b{_UNIT_MARKERS}\b.*$", "", s).strip()
     return s
 
 
 # ============================================================
-# EnerGov – WEST PALM BEACH ONLY
+# Helpers: date + permit extraction
+# ============================================================
+_DATE_RE = re.compile(r"\b(0?[1-9]|1[0-2])/(0?[1-9]|[12]\d|3[01])/(19|20)\d{2}\b")
+_PERMIT_RE = re.compile(r"\b[A-Z]{0,4}\d{3,}(?:-\d+)?\b")
+
+_ROOF_TERMS = (
+    "ROOF", "REROOF", "RE-ROOF", "RE ROOF",
+    "ROOFING", "ROOF REPLAC", "REROOFING",
+)
+
+def _parse_date(mmddyyyy: str) -> Optional[_dt.date]:
+    try:
+        mm, dd, yy = mmddyyyy.split("/")
+        return _dt.date(int(yy), int(mm), int(dd))
+    except Exception:
+        return None
+
+def _extract_permit_no(text: str) -> str:
+    m = _PERMIT_RE.search(text)
+    return m.group(0) if m else ""
+
+
+# ============================================================
+# EnerGov Connector (West Palm Beach focused)
 # ============================================================
 @dataclass
 class EnerGovConnector:
-    """
-    STRICTLY for WEST PALM BEACH EnerGov.
-    Assumes a permit grid with a 'Roof date' column.
-    """
     portal: Any  # Jurisdiction object OR string URL
 
     def __post_init__(self):
         if isinstance(self.portal, str):
-            self.portal_url = self.portal
+            self.portal_url = self.portal.strip()
         else:
-            self.portal_url = getattr(self.portal, "portal_url", "")
+            self.portal_url = (getattr(self.portal, "portal_url", "") or "").strip()
 
         if not self.portal_url.startswith("http"):
             raise ValueError("Invalid EnerGov portal URL")
 
-    # --------------------------------------------------------
-    # MAIN SEARCH
-    # --------------------------------------------------------
     def search_roof(self, address: str) -> Dict[str, Any]:
-        query_used = parse_address(address)
+        query_used = normalize_address(address)
+        if not query_used:
+            return {"roof_detected": False, "error": "Empty address", "query_used": ""}
 
         ctx = _get_context()
         page = ctx.new_page()
-        page.set_default_timeout(30000)
+        page.set_default_timeout(35000)
 
         try:
-            # 1️⃣ Load portal
+            # 1) Load WPB search page
             page.goto(self.portal_url, wait_until="domcontentloaded")
 
-            # EnerGov SPA routing
-            try:
-                page.wait_for_url("**/search*", timeout=20000)
-            except Exception:
-                pass
+            # Give SPA a moment
+            time.sleep(0.8)
 
-            # 2️⃣ Wait for search input
-            page.wait_for_selector("input", timeout=20000)
-            time.sleep(0.5)
+            # 2) Find a usable search box (EnerGov variations)
+            search_box = None
+            candidates = [
+                'input[type="search"]',
+                'input[placeholder*="Search" i]',
+                'input[placeholder*="Address" i]',
+                'input[aria-label*="Search" i]',
+                'input[aria-label*="Address" i]',
+                'input',
+            ]
+            for sel in candidates:
+                try:
+                    el = page.query_selector(sel)
+                    if el:
+                        # make sure visible/enabled-ish
+                        try:
+                            if el.is_visible():
+                                search_box = el
+                                break
+                        except Exception:
+                            search_box = el
+                            break
+                except Exception:
+                    pass
 
-            # 3️⃣ Enter address
-            search_box = page.query_selector('input[type="search"], input[placeholder*="Address" i], input')
             if not search_box:
-                return self._error("No search input found", query_used)
+                return {"roof_detected": False, "error": "EnerGov page: no input fields found", "query_used": query_used}
 
+            # 3) Run search
             search_box.click()
             search_box.fill(query_used)
             page.keyboard.press("Enter")
 
-            # 4️⃣ Wait for results grid
-            time.sleep(2.0)
+            # 4) Wait for results: anchor on "Roof date" column header (you confirmed it exists)
+            # If it never appears, the results grid didn't load / selector changed.
+            try:
+                page.wait_for_selector("text=/Roof\\s*date/i", timeout=25000)
+            except Exception:
+                # Sometimes the grid loads without that exact text; fallback to any rows
+                pass
 
-            # ====================================================
-            # IMPORTANT PART: ROW-LEVEL PARSING
-            # ====================================================
-            # WPB EnerGov uses row-based permit cards / rows
-            rows = page.query_selector_all(
-                '[role="row"], .mat-row, .permit-row, tr'
-            )
+            time.sleep(1.0)
 
-            roofing_rows: List[Dict[str, Any]] = []
+            # 5) Locate the grid/container near "Roof date"
+            grid_handle = None
+            try:
+                # Try to find the header element
+                hdr = page.locator("text=/Roof\\s*date/i").first
+                # climb to a likely grid/table container
+                grid = hdr.locator(
+                    "xpath=ancestor::*[self::table or @role='grid' or @role='table' or contains(@class,'mat-table') or contains(@class,'mat-mdc-table') or contains(@class,'ag-root') or contains(@class,'grid')][1]"
+                )
+                if grid.count() > 0:
+                    grid_handle = grid.first
+            except Exception:
+                grid_handle = None
 
-            for row in rows:
+            # Fallback: pick the biggest visible table/grid-ish thing
+            if grid_handle is None:
+                # try table
+                t = page.locator("table").first
+                if t.count() > 0:
+                    grid_handle = t
+                else:
+                    # try any grid role
+                    g = page.locator("[role='grid'], [role='table']").first
+                    if g.count() > 0:
+                        grid_handle = g
+
+            if grid_handle is None:
+                return {"roof_detected": False, "error": "EnerGov: results grid not found", "query_used": query_used}
+
+            # 6) Force-render rows (virtualized grids need scroll)
+            # We scroll a few times; if scroll fails, we still attempt a read.
+            for _ in range(6):
                 try:
-                    text = row.inner_text().upper()
+                    grid_handle.evaluate("el => { el.scrollBy(0, el.scrollHeight); }")
                 except Exception:
+                    try:
+                        page.mouse.wheel(0, 1200)
+                    except Exception:
+                        pass
+                time.sleep(0.35)
+
+            # 7) Collect row texts from within the grid (row-level parsing)
+            row_loc = grid_handle.locator(
+                "xpath=.//*[self::tr or @role='row' or contains(@class,'mat-row') or contains(@class,'mat-mdc-row') or contains(@class,'ag-row') or contains(@class,'row')]"
+            )
+            row_count = row_loc.count()
+
+            # Sometimes the “row” elements are actually div cards; add fallback card selector
+            card_loc = grid_handle.locator("xpath=.//*[contains(@class,'card') or contains(@class,'result') or contains(@class,'item')]")
+            card_count = card_loc.count()
+
+            texts: List[str] = []
+            if row_count > 0:
+                for i in range(min(row_count, 120)):  # cap
+                    try:
+                        txt = row_loc.nth(i).inner_text(timeout=2000)
+                        txt = (txt or "").strip()
+                        if txt:
+                            texts.append(txt)
+                    except Exception:
+                        continue
+            elif card_count > 0:
+                for i in range(min(card_count, 120)):  # cap
+                    try:
+                        txt = card_loc.nth(i).inner_text(timeout=2000)
+                        txt = (txt or "").strip()
+                        if txt:
+                            texts.append(txt)
+                    except Exception:
+                        continue
+
+            if not texts:
+                return {"roof_detected": False, "error": "EnerGov: no result rows detected", "query_used": query_used}
+
+            # 8) Filter roofing permits + extract row-scoped roof date
+            roofing: List[Tuple[_dt.date, str, str]] = []  # (date, permit_no, type_line)
+
+            for t in texts:
+                up = t.upper()
+
+                if not any(k in up for k in _ROOF_TERMS):
                     continue
 
-                if not any(k in text for k in ("ROOF", "REROOF", "RE-ROOF")):
+                # Row-scoped date: take the most relevant date in THIS ROW
+                dates = _DATE_RE.findall(up)
+                # findall returns tuples because of groups; re-find with finditer
+                dvals = [m.group(0) for m in _DATE_RE.finditer(up)]
+                row_dates: List[_dt.date] = []
+                for dv in dvals:
+                    dd = _parse_date(dv)
+                    if dd:
+                        row_dates.append(dd)
+
+                if not row_dates:
                     continue
 
-                # --- Extract Roof Date (column-based) ---
-                date = self._extract_roof_date_from_row(row)
-                if not date:
-                    continue
+                # WPB has a “Roof date” column; usually only one date per row.
+                # If multiple dates exist, choose the latest date in the row.
+                best_date = max(row_dates)
 
-                permit_no = self._extract_permit_no(text)
+                permit_no = _extract_permit_no(up)
+                type_line = "REROOF" if ("REROOF" in up or "RE-ROOF" in up or "RE ROOF" in up) else "ROOF"
 
-                roofing_rows.append({
-                    "roof_date": date,
-                    "permit_no": permit_no,
-                    "text": text,
-                })
+                roofing.append((best_date, permit_no, type_line))
 
-            if not roofing_rows:
-                return {
-                    "roof_detected": False,
-                    "query_used": query_used,
-                    "error": "NO_ROOF_PERMIT_FOUND",
-                }
+            if not roofing:
+                return {"roof_detected": False, "error": "NO_ROOF_PERMIT_FOUND", "query_used": query_used}
 
-            # 5️⃣ Pick MOST RECENT roofing permit
-            roofing_rows.sort(key=lambda r: r["roof_date"], reverse=True)
-            best = roofing_rows[0]
+            # 9) Choose most recent roofing permit
+            roofing.sort(key=lambda x: x[0], reverse=True)
+            roof_date, permit_no, type_line = roofing[0]
 
-            roof_date = best["roof_date"]
-            yrs = (datetime.date.today() - roof_date).days / 365.25
-
+            yrs = (_dt.date.today() - roof_date).days / 365.25
             return {
                 "roof_detected": True,
                 "query_used": query_used,
-                "permit_no": best["permit_no"] or "",
-                "type_line": "ROOF",
+                "permit_no": permit_no or "",
+                "type_line": type_line,
                 "roof_date": roof_date.strftime("%m/%d/%Y"),
                 "issued": "",
                 "finalized": "",
                 "applied": "",
                 "roof_years": f"{yrs:.1f}",
-                "is_20plus": "True" if yrs >= 20 else "False",
+                "is_20plus": "True" if yrs >= 20.0 else "False",
                 "error": "",
             }
 
         except PWTimeoutError:
-            return self._error("EnerGov timeout", query_used)
+            return {"roof_detected": False, "error": "EnerGov timeout loading/searching", "query_used": query_used}
         except Exception as e:
-            return self._error(f"EnerGov error: {e}", query_used)
+            return {"roof_detected": False, "error": f"EnerGov error: {type(e).__name__}: {e}", "query_used": query_used}
         finally:
             try:
                 page.close()
             except Exception:
                 pass
-
-    # --------------------------------------------------------
-    # HELPERS
-    # --------------------------------------------------------
-    def _extract_roof_date_from_row(self, row) -> Optional[datetime.date]:
-        """
-        West Palm Beach rows contain a visible 'Roof date' cell.
-        We scan child cells, not the whole page.
-        """
-        try:
-            cells = row.query_selector_all("td, div, span")
-        except Exception:
-            return None
-
-        for c in cells:
-            try:
-                t = c.inner_text().strip()
-            except Exception:
-                continue
-
-            if re.fullmatch(r"\d{1,2}/\d{1,2}/\d{4}", t):
-                try:
-                    m, d, y = t.split("/")
-                    return datetime.date(int(y), int(m), int(d))
-                except Exception:
-                    continue
-        return None
-
-    def _extract_permit_no(self, text: str) -> str:
-        m = re.search(r"\b[A-Z]{0,3}\d{4,}-?\d*\b", text)
-        return m.group(0) if m else ""
-
-    def _error(self, msg: str, query: str) -> Dict[str, Any]:
-        return {
-            "roof_detected": False,
-            "query_used": query,
-            "error": msg,
-        }
