@@ -48,16 +48,10 @@ def seed_default() -> None:
             "state": "FL",
             "name": "WEST PALM BEACH",
             "system": "energov",
-            "portal_url": "https://westpalmbeachfl-energovpub.tylerhost.net/apps/selfservice/WestPalmBeachFLProd#/search?m=2&ps=10&pn=1&em=true",
+            "portal_url": "https://westpalmbeachfl-energovpub.tylerhost.net/apps/selfservice/WestPalmBeachFLProd#/search",
             "active": 1,
         },
-        {
-            "state": "FL",
-            "name": "CAPE CORAL",
-            "system": "energov",
-            "portal_url": "https://energovweb.capecoral.gov/EnerGovProd/selfservice#/search?m=2&ps=10&pn=1&em=true",
-            "active": 1,
-        },
+ 
     ]
 
     for d in defaults:
