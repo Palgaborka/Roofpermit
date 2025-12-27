@@ -11,33 +11,21 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from parcels import fetch_parcel_addresses_in_polygon
-from scanner import EnerGovScanner
+from parcels import fetch_parcel_objects_in_polygon
 from utils import LeadRow, clean_street_address
+from jurisdictions import seed_default, list_active, get_by_id, add_jurisdiction
+from connectors import get_connector
 
-# PDF
 from reportlab.lib.pagesizes import letter, landscape
 from reportlab.pdfgen import canvas
 from reportlab.lib.units import inch
 
-# -----------------------------
-# CONFIG / PRIVATE ACCESS
-# -----------------------------
-
-SECRET_KEY = os.environ.get("SECRET_KEY", "").strip()
-if not SECRET_KEY:
-    SECRET_KEY = "CHANGE_ME"
-
+SECRET_KEY = os.environ.get("SECRET_KEY", "").strip() or "CHANGE_ME"
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
-
 STATIC_DIR = Path(__file__).parent / "static"
 
-# -----------------------------
-# APP
-# -----------------------------
-
-app = FastAPI(title="RoofSpy (Private)")
+app = FastAPI(title="RoofSpy (Florida-Ready)")
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 def require_key(request: Request):
@@ -45,9 +33,7 @@ def require_key(request: Request):
     if k != SECRET_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-# -----------------------------
-# Scan state
-# -----------------------------
+seed_default()
 
 scan_lock = threading.Lock()
 scan_thread: Optional[threading.Thread] = None
@@ -71,25 +57,22 @@ def write_csv(path: Path, rows: List[LeadRow]):
     with path.open("w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow([
-            "address", "location", "query_used", "permit_no", "type_line",
+            "address", "owner",
+            "query_used", "permit_no", "type_line",
             "roof_date_used", "issued", "finalized", "applied",
             "roof_years", "is_20plus", "status", "seconds"
         ])
         for r in rows:
             w.writerow([
-                r.address, r.location, r.query_used, r.permit_no, r.type_line,
+                r.address, r.owner,
+                r.query_used, r.permit_no, r.type_line,
                 r.roof_date_used, r.issued, r.finalized, r.applied,
                 r.roof_years, r.is_20plus, r.status, r.seconds
             ])
 
 def rows_to_pdf_bytes(rows: List[LeadRow], title: str) -> bytes:
-    """
-    Simple PDF report that opens directly in Safari.
-    """
     from io import BytesIO
     buf = BytesIO()
-
-    # Landscape letter for more columns
     page_size = landscape(letter)
     c = canvas.Canvas(buf, pagesize=page_size)
 
@@ -105,9 +88,8 @@ def rows_to_pdf_bytes(rows: List[LeadRow], title: str) -> bytes:
 
     y = top - 40
 
-    # Columns (keep it readable on phone)
-    headers = ["Address", "Roof Date", "Years", "20+?", "Permit #", "Type", "Status"]
-    col_x = [left, left + 230, left + 310, left + 360, left + 420, left + 520, left + 720]
+    headers = ["Address", "Owner", "Roof Date", "Years", "20+?", "Permit #", "Type", "Status"]
+    col_x = [left, left + 250, left + 430, left + 510, left + 560, left + 620, left + 740, left + 860]
 
     def draw_row(vals, bold=False):
         nonlocal y
@@ -117,11 +99,8 @@ def rows_to_pdf_bytes(rows: List[LeadRow], title: str) -> bytes:
         c.setFont("Helvetica-Bold" if bold else "Helvetica", 9)
         for i, v in enumerate(vals):
             txt = (v or "")
-            # hard truncate to keep layout
-            if len(txt) > 42 and i in (0, 5, 6):
-                txt = txt[:39] + "…"
-            if len(txt) > 26 and i in (4,):
-                txt = txt[:23] + "…"
+            if len(txt) > 40 and i in (0, 1, 6, 7):
+                txt = txt[:37] + "…"
             c.drawString(col_x[i], y, txt)
         y -= line_h
 
@@ -132,6 +111,7 @@ def rows_to_pdf_bytes(rows: List[LeadRow], title: str) -> bytes:
     for r in rows:
         draw_row([
             r.address,
+            r.owner,
             r.roof_date_used,
             r.roof_years,
             "YES" if r.is_20plus == "True" else ("NO" if r.is_20plus else ""),
@@ -143,8 +123,25 @@ def rows_to_pdf_bytes(rows: List[LeadRow], title: str) -> bytes:
     c.save()
     return buf.getvalue()
 
-def run_scan(addresses: List[str], delay_seconds: float, fast_mode: bool):
+def run_scan(parcels: List[Dict[str, str]], jurisdiction_id: int, delay_seconds: float, fast_mode: bool):
     global scan_stop_flag, _last_all_csv, _last_good_csv
+
+    j = get_by_id(jurisdiction_id)
+    if not j or j.active != 1:
+        with scan_lock:
+            scan_status.update({"running": False, "message": "Invalid jurisdiction."})
+        return
+
+    connector = get_connector(j)
+
+    owner_by_addr = {}
+    addresses = []
+    for p in parcels:
+        addr = clean_street_address((p.get("address") or "").strip())
+        if not addr:
+            continue
+        addresses.append(addr)
+        owner_by_addr[addr] = (p.get("owner") or "").strip()
 
     with scan_lock:
         scan_status.update({
@@ -154,98 +151,90 @@ def run_scan(addresses: List[str], delay_seconds: float, fast_mode: bool):
             "good": 0,
             "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "finished_at": "",
-            "message": "Starting scanner…",
+            "message": f"Scanning {j.name}…",
         })
         scan_rows.clear()
         scan_stop_flag = False
 
     consecutive_errors = 0
-    base_delay = max(0.8, float(delay_seconds))
+    base_delay = max(0.6, float(delay_seconds))
     if fast_mode:
-        base_delay = max(0.5, float(delay_seconds))
+        base_delay = max(0.4, float(delay_seconds))
 
     try:
-        with EnerGovScanner(fast_mode=fast_mode) as scanner:
+        for addr in addresses:
             with scan_lock:
-                scan_status["message"] = f"Scanning… (fast_mode={'ON' if fast_mode else 'OFF'})"
+                if scan_stop_flag:
+                    scan_status["message"] = "Stopped."
+                    break
 
-            for addr in addresses:
+            t0 = time.time()
+            owner = owner_by_addr.get(addr, "")
+
+            try:
+                res = connector.search_roof(addr)
+                elapsed = time.time() - t0
+
+                if not res.get("roof_detected"):
+                    err = (res.get("error") or "").strip()
+                    status = "NO_ROOF_PERMIT_FOUND" if not err else f"ERROR: {err}"
+                    row = LeadRow(
+                        address=addr, owner=owner,
+                        query_used=str(res.get("query_used", "")),
+                        status=status, seconds=f"{elapsed:.1f}",
+                    )
+                    consecutive_errors = consecutive_errors + 1 if err else 0
+                else:
+                    yrs_val = res.get("roof_years", "")
+                    yrs_str = ""
+                    if yrs_val != "":
+                        try:
+                            yrs_str = f"{float(yrs_val):.1f}"
+                        except Exception:
+                            yrs_str = str(yrs_val)
+
+                    row = LeadRow(
+                        address=addr, owner=owner,
+                        query_used=str(res.get("query_used", "")),
+                        permit_no=str(res.get("permit_no", "")),
+                        type_line=str(res.get("type_line", "")),
+                        roof_date_used=str(res.get("roof_date", "")),
+                        issued=str(res.get("issued", "")),
+                        finalized=str(res.get("finalized", "")),
+                        applied=str(res.get("applied", "")),
+                        roof_years=yrs_str,
+                        is_20plus=str(res.get("is_20plus", "")),
+                        status="OK",
+                        seconds=f"{elapsed:.1f}",
+                    )
+                    consecutive_errors = 0
+
                 with scan_lock:
-                    if scan_stop_flag:
-                        scan_status["message"] = "Stopped."
-                        break
+                    scan_rows.append(row)
+                    scan_status["done"] += 1
+                    if row.is_20plus == "True":
+                        scan_status["good"] += 1
+                    scan_status["message"] = f"Last: {addr} ({row.seconds}s)"
 
-                addr_clean = clean_street_address(addr)
-                t0 = time.time()
+            except Exception as e:
+                elapsed = time.time() - t0
+                consecutive_errors += 1
+                row = LeadRow(address=addr, owner=owner, status=f"ERROR: {type(e).__name__}: {e}", seconds=f"{elapsed:.1f}")
+                with scan_lock:
+                    scan_rows.append(row)
+                    scan_status["done"] += 1
+                    scan_status["message"] = f"Last ERROR: {addr} ({row.seconds}s)"
 
-                try:
-                    res = scanner.search_address(addr_clean)
-                    elapsed = time.time() - t0
+            extra = 0.0
+            if consecutive_errors >= 4:
+                extra = 1.6
+            elif consecutive_errors == 3:
+                extra = 1.0
+            elif consecutive_errors == 2:
+                extra = 0.6
 
-                    if not res.get("roof_detected"):
-                        err = (res.get("error") or "").strip()
-                        status = "NO_ROOF_PERMIT_FOUND" if not err else f"ERROR: {err}"
-                        row = LeadRow(
-                            address=addr_clean,
-                            query_used=str(res.get("query_used", "")),
-                            status=status,
-                            seconds=f"{elapsed:.1f}",
-                        )
-                        if err:
-                            consecutive_errors += 1
-                        else:
-                            consecutive_errors = 0
-                    else:
-                        yrs_val = res.get("roof_years", "")
-                        yrs_str = ""
-                        if yrs_val != "":
-                            try:
-                                yrs_str = f"{float(yrs_val):.1f}"
-                            except Exception:
-                                yrs_str = str(yrs_val)
-
-                        row = LeadRow(
-                            address=addr_clean,
-                            query_used=str(res.get("query_used", "")),
-                            permit_no=str(res.get("permit_no", "")),
-                            type_line=str(res.get("type_line", "")),
-                            roof_date_used=str(res.get("roof_date", "")),
-                            issued=str(res.get("issued", "")),
-                            finalized=str(res.get("finalized", "")),
-                            applied=str(res.get("applied", "")),
-                            roof_years=yrs_str,
-                            is_20plus=str(res.get("is_20plus", "")),
-                            status="OK",
-                            seconds=f"{elapsed:.1f}",
-                        )
-                        consecutive_errors = 0
-
-                    with scan_lock:
-                        scan_rows.append(row)
-                        scan_status["done"] += 1
-                        if row.is_20plus == "True":
-                            scan_status["good"] += 1
-                        scan_status["message"] = f"Last: {addr_clean} ({row.seconds}s) | errors-in-row={consecutive_errors}"
-
-                except Exception as e:
-                    elapsed = time.time() - t0
-                    consecutive_errors += 1
-                    row = LeadRow(address=addr_clean, status=f"ERROR: {type(e).__name__}: {e}", seconds=f"{elapsed:.1f}")
-                    with scan_lock:
-                        scan_rows.append(row)
-                        scan_status["done"] += 1
-                        scan_status["message"] = f"Last ERROR: {addr_clean} ({row.seconds}s)"
-
-                extra = 0.0
-                if consecutive_errors >= 4:
-                    extra = 1.6
-                elif consecutive_errors == 3:
-                    extra = 1.0
-                elif consecutive_errors == 2:
-                    extra = 0.6
-
-                jitter = random.uniform(0.15, 0.55)
-                time.sleep(base_delay + extra + jitter)
+            jitter = random.uniform(0.15, 0.55)
+            time.sleep(base_delay + extra + jitter)
 
     finally:
         ts = time.strftime("%Y%m%d_%H%M%S")
@@ -257,22 +246,39 @@ def run_scan(addresses: List[str], delay_seconds: float, fast_mode: bool):
             good_copy = [r for r in rows_copy if r.is_20plus == "True"]
             scan_status["running"] = False
             scan_status["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-            scan_status["message"] = f"Done. Saved: {all_path.name} and {good_path.name}"
+            scan_status["message"] = "Done."
 
         write_csv(all_path, rows_copy)
         write_csv(good_path, good_copy)
-
         _last_all_csv = all_path
         _last_good_csv = good_path
-
-# -----------------------------
-# Routes
-# -----------------------------
 
 @app.get("/", response_class=HTMLResponse)
 def root(request: Request):
     require_key(request)
     return HTMLResponse((STATIC_DIR / "index.html").read_text(encoding="utf-8"))
+
+@app.get("/api/jurisdictions")
+def api_jurisdictions(request: Request):
+    require_key(request)
+    items = list_active("FL")
+    return JSONResponse({"ok": True, "jurisdictions": [j.__dict__ for j in items]})
+
+@app.post("/api/jurisdictions/add")
+async def api_jurisdictions_add(request: Request):
+    require_key(request)
+    body = await request.json()
+
+    state = (body.get("state") or "FL").strip().upper()
+    name = (body.get("name") or "").strip()
+    system = (body.get("system") or "").strip().lower()
+    portal_url = (body.get("portal_url") or "").strip()
+
+    if not name or not system or not portal_url:
+        return JSONResponse({"ok": False, "error": "Missing name/system/portal_url"})
+
+    new_id = add_jurisdiction(state, name, system, portal_url, active=1)
+    return JSONResponse({"ok": True, "id": new_id})
 
 @app.get("/api/status")
 def api_status(request: Request):
@@ -289,8 +295,8 @@ async def api_parcels(request: Request):
     if not latlngs or not isinstance(latlngs, list):
         return JSONResponse({"ok": False, "error": "Missing latlngs (draw an area first)."})
     try:
-        addresses = fetch_parcel_addresses_in_polygon(latlngs, limit=limit)
-        return JSONResponse({"ok": True, "addresses": addresses})
+        parcels = fetch_parcel_objects_in_polygon(latlngs, limit=limit)
+        return JSONResponse({"ok": True, "parcels": parcels})
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)})
 
@@ -299,19 +305,23 @@ async def api_start(request: Request):
     global scan_thread
     require_key(request)
     body = await request.json()
-    addresses = body.get("addresses") or []
+
+    jurisdiction_id = int(body.get("jurisdiction_id") or 0)
+    parcels = body.get("parcels") or []
     delay = float(body.get("delay", 1.0))
     fast_mode = bool(body.get("fast_mode", False))
 
-    if not addresses:
-        return JSONResponse({"ok": False, "error": "No addresses provided."})
+    if not jurisdiction_id:
+        return JSONResponse({"ok": False, "error": "Missing jurisdiction_id"})
+    if not parcels or not isinstance(parcels, list):
+        return JSONResponse({"ok": False, "error": "No parcels provided."})
 
     with scan_lock:
         if scan_status.get("running"):
             return JSONResponse({"ok": False, "error": "Scan already running."})
 
     def runner():
-        run_scan(addresses, delay_seconds=delay, fast_mode=fast_mode)
+        run_scan(parcels, jurisdiction_id=jurisdiction_id, delay_seconds=delay, fast_mode=fast_mode)
 
     scan_thread = threading.Thread(target=runner, daemon=True)
     scan_thread.start()
@@ -326,7 +336,28 @@ def api_stop(request: Request):
         scan_status["message"] = "Stopping…"
     return JSONResponse({"ok": True})
 
-# CSV downloads (still available)
+@app.get("/download/all.pdf")
+def download_all_pdf(request: Request):
+    require_key(request)
+    with scan_lock:
+        rows_copy = list(scan_rows)
+    if not rows_copy:
+        raise HTTPException(404, "No results in memory yet. Run a scan first.")
+    pdf = rows_to_pdf_bytes(rows_copy, title="RoofSpy Results (ALL)")
+    return Response(content=pdf, media_type="application/pdf",
+                    headers={"Content-Disposition": "inline; filename=roofspy_all.pdf"})
+
+@app.get("/download/good.pdf")
+def download_good_pdf(request: Request):
+    require_key(request)
+    with scan_lock:
+        rows_copy = [r for r in scan_rows if r.is_20plus == "True"]
+    if not rows_copy:
+        raise HTTPException(404, "No 20+ year leads in memory yet. Run a scan first.")
+    pdf = rows_to_pdf_bytes(rows_copy, title="RoofSpy Results (GOOD 20+)")
+    return Response(content=pdf, media_type="application/pdf",
+                    headers={"Content-Disposition": "inline; filename=roofspy_good_20plus.pdf"})
+
 @app.get("/download/all")
 def download_all(request: Request):
     require_key(request)
@@ -340,32 +371,3 @@ def download_good(request: Request):
     if not _last_good_csv or not _last_good_csv.exists():
         raise HTTPException(404, "No CSV available yet.")
     return FileResponse(str(_last_good_csv), filename=_last_good_csv.name)
-
-# NEW: PDF opens directly in Safari
-@app.get("/download/all.pdf")
-def download_all_pdf(request: Request):
-    require_key(request)
-    with scan_lock:
-        rows_copy = list(scan_rows)
-    if not rows_copy:
-        raise HTTPException(404, "No results in memory yet. Run a scan first.")
-    pdf = rows_to_pdf_bytes(rows_copy, title="RoofSpy Results (ALL)")
-    return Response(
-        content=pdf,
-        media_type="application/pdf",
-        headers={"Content-Disposition": "inline; filename=roofspy_all.pdf"}
-    )
-
-@app.get("/download/good.pdf")
-def download_good_pdf(request: Request):
-    require_key(request)
-    with scan_lock:
-        rows_copy = [r for r in scan_rows if r.is_20plus == "True"]
-    if not rows_copy:
-        raise HTTPException(404, "No 20+ year leads in memory yet. Run a scan first.")
-    pdf = rows_to_pdf_bytes(rows_copy, title="RoofSpy Results (GOOD 20+)")
-    return Response(
-        content=pdf,
-        media_type="application/pdf",
-        headers={"Content-Disposition": "inline; filename=roofspy_good_20plus.pdf"}
-    )
