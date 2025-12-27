@@ -48,7 +48,8 @@ def seed_default() -> None:
             "state": "FL",
             "name": "WEST PALM BEACH",
             "system": "energov",
-            "portal_url": "https://westpalmbeachfl-energovpub.tylerhost.net/apps/selfservice/WestPalmBeachFLProd#/search",
+            "portal_url": "https://westpalmbeachfl-energovpub.tylerhost.net/apps/selfservice/WestPalmBeachFLProd#/search?m=2&ps=10&pn=1&em=true
+",
             "active": 1,
         },
  
