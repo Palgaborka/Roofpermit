@@ -165,6 +165,7 @@ def add_jurisdiction(
     )
     _save_db(db)
     return new_id
+    
 def delete_jurisdiction(jurisdiction_id: int) -> bool:
     """
     Deletes a jurisdiction by numeric id.
